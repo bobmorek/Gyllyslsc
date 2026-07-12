@@ -13,6 +13,7 @@
     .no-print { display: none !important; }
     body { background: #fff !important; }
   }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -214,6 +215,98 @@ async function deleteRecord(id) {
   return next;
 }
 
+// ---- GitHub persistence (commit records to the repo via the REST API) -------
+// Records are written as JSON files under `records/` in the repo. The page is a
+// static site, so writes go straight from the browser to the GitHub API using a
+// personal access token the user provides. The token lives only in this browser.
+
+const GH_LS = "ra:gh";
+const GH_DIR = "records";
+
+function loadGh() {
+  let cfg = {};
+  try { cfg = JSON.parse(LS.getItem(GH_LS) || "{}") || {}; } catch { cfg = {}; }
+  // Prefill owner/repo from the Pages host (e.g. bobmorek.github.io/Gyllyslsc).
+  try {
+    const m = location.hostname.match(/^([^.]+)\.github\.io$/);
+    if (m && !cfg.owner) cfg.owner = m[1];
+    const seg = location.pathname.split("/").filter(Boolean)[0];
+    if (seg && !cfg.repo && /\.github\.io$/.test(location.hostname)) cfg.repo = seg;
+  } catch {}
+  if (!cfg.branch) cfg.branch = "main";
+  return cfg;
+}
+function ghConfigured(gh) { return !!(gh && gh.owner && gh.repo && gh.token); }
+
+// UTF-8 safe base64 for the Contents API (which wants base64-encoded content).
+const b64encode = (s) => btoa(unescape(encodeURIComponent(s)));
+const b64decode = (b) => decodeURIComponent(escape(atob(b)));
+
+async function ghApi(gh, path, opts = {}) {
+  return fetch(`https://api.github.com/repos/${gh.owner}/${gh.repo}/${path}`, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${gh.token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...(opts.headers || {}),
+    },
+  });
+}
+const ghRef = (gh) => encodeURIComponent(gh.branch || "main");
+
+async function ghGetSha(gh, filePath) {
+  const r = await ghApi(gh, `contents/${filePath}?ref=${ghRef(gh)}`);
+  if (r.ok) return (await r.json()).sha;
+  return null; // 404 → file doesn't exist yet
+}
+
+async function ghPutRecord(gh, rec) {
+  const filePath = `${GH_DIR}/${rec.id}.json`;
+  const store = { id: rec.id, form: rec.form, updated: rec.updated };
+  const body = {
+    message: `Save risk assessment ${rec.form.raNo || rec.id}`,
+    content: b64encode(JSON.stringify(store, null, 2)),
+    branch: gh.branch || "main",
+  };
+  let sha = rec._sha || (await ghGetSha(gh, filePath));
+  if (sha) body.sha = sha;
+  let r = await ghApi(gh, `contents/${filePath}`, { method: "PUT", body: JSON.stringify(body) });
+  if (r.status === 409 || r.status === 422) {
+    // sha was stale — refetch the current one and retry once.
+    const fresh = await ghGetSha(gh, filePath);
+    if (fresh) { body.sha = fresh; r = await ghApi(gh, `contents/${filePath}`, { method: "PUT", body: JSON.stringify(body) }); }
+  }
+  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 160)}`);
+  return (await r.json()).content.sha;
+}
+
+async function ghListRecords(gh) {
+  const r = await ghApi(gh, `contents/${GH_DIR}?ref=${ghRef(gh)}`);
+  if (r.status === 404) return []; // records/ not created yet
+  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 160)}`);
+  const files = (await r.json()).filter((f) => f.type === "file" && f.name.endsWith(".json"));
+  const recs = await Promise.all(files.map(async (f) => {
+    const cr = await ghApi(gh, `contents/${GH_DIR}/${f.name}?ref=${ghRef(gh)}`);
+    if (!cr.ok) return null;
+    const cj = await cr.json();
+    try { const rec = JSON.parse(b64decode(cj.content)); rec._sha = cj.sha; return rec; }
+    catch { return null; }
+  }));
+  return recs.filter(Boolean);
+}
+
+async function ghDeleteRecord(gh, rec) {
+  const filePath = `${GH_DIR}/${rec.id}.json`;
+  const sha = rec._sha || (await ghGetSha(gh, filePath));
+  if (!sha) return; // already gone
+  const r = await ghApi(gh, `contents/${filePath}`, {
+    method: "DELETE",
+    body: JSON.stringify({ message: `Delete risk assessment ${rec.form.raNo || rec.id}`, sha, branch: gh.branch || "main" }),
+  });
+  if (!r.ok && r.status !== 404) throw new Error(`${r.status} ${(await r.text()).slice(0, 160)}`);
+}
+
 // ---- Small UI pieces -------------------------------------------------------
 
 const optColor = (v) =>
@@ -291,6 +384,63 @@ function SectionCard({ title, accent, children }) {
   );
 }
 
+// Save-status pill shown next to the Save button in the form view.
+function SaveStatus({ saveMsg, savedAt }) {
+  const base = { display: "flex", alignItems: "center", gap: 5, fontSize: 12, fontWeight: 600 };
+  if (saveMsg?.kind === "saving") return <span style={{ ...base, color: COLORS.mid }}><RefreshCw size={13} style={{ animation: "spin 1s linear infinite" }} /> Saving to GitHub…</span>;
+  if (saveMsg?.kind === "github") return <span style={{ ...base, color: COLORS.green }}><CheckCircle2 size={14} /> Saved to GitHub</span>;
+  if (saveMsg?.kind === "local") return <span style={{ ...base, color: COLORS.green }}><CheckCircle2 size={14} /> Saved locally</span>;
+  if (saveMsg?.kind === "local-only") return <span title={saveMsg.msg} style={{ ...base, color: "#b9770e" }}><AlertTriangle size={14} /> Saved locally · GitHub failed</span>;
+  if (savedAt) return <span style={{ ...base, color: COLORS.green }}><CheckCircle2 size={14} /> Saved</span>;
+  return null;
+}
+
+// GitHub save settings + status, shown at the top of the list view.
+function GitHubSync({ gh, onChange, onSync, syncMsg }) {
+  const [open, setOpen] = React.useState(false);
+  const set = (k, v) => onChange({ ...gh, [k]: v });
+  const on = ghConfigured(gh);
+  const btn = { fontSize: 12.5, fontWeight: 700, padding: "7px 13px", borderRadius: 8, cursor: "pointer", fontFamily: "inherit", border: "1.5px solid #dde3ec", background: "#fff", color: COLORS.navy };
+  const btnPrimary = { ...btn, border: "none", background: COLORS.mid, color: "#fff" };
+  return (
+    <div style={{ background: "#fff", border: `1px solid ${on ? COLORS.green + "66" : "#e6eaf1"}`, borderRadius: 12, padding: "12px 16px", marginBottom: 18, boxShadow: "0 1px 3px rgba(8,20,92,.04)" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <CheckCircle2 size={16} color={on ? COLORS.green : "#9aa5b1"} />
+          <span style={{ fontSize: 13.5, fontWeight: 700, color: COLORS.navy }}>Save to GitHub · {on ? "on" : "off"}</span>
+          {on && <span style={{ fontSize: 12, color: "#6b7684" }}>{gh.owner}/{gh.repo}@{gh.branch || "main"}</span>}
+          {syncMsg?.kind === "loading" && <span style={{ fontSize: 12, color: "#6b7684" }}>Syncing…</span>}
+          {syncMsg?.kind === "ok" && <span style={{ fontSize: 12, color: COLORS.green }}>Loaded {syncMsg.n} from GitHub</span>}
+          {syncMsg?.kind === "error" && <span style={{ fontSize: 12, color: "#c0392b" }}>{syncMsg.msg}</span>}
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          {on && <button onClick={onSync} style={btn}>Sync now</button>}
+          <button onClick={() => setOpen((o) => !o)} style={btnPrimary}>{open ? "Close" : on ? "Settings" : "Connect"}</button>
+        </div>
+      </div>
+      {open && (
+        <div style={{ marginTop: 12, display: "grid", gap: 11 }}>
+          <div style={{ fontSize: 12, color: "#6b7684", lineHeight: 1.5 }}>
+            Saving commits each assessment as a JSON file under <code>records/</code> in your repo. Paste a GitHub{" "}
+            <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer" style={{ color: COLORS.mid }}>fine-grained personal access token</a>{" "}
+            with <b>Contents: Read and write</b> on this one repository. The token is stored only in this browser — anyone who can use this device can read it, so keep it repo-scoped and revoke it if the device is shared.
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 10 }}>
+            <Field label="Owner" value={gh.owner || ""} onChange={(v) => set("owner", v.trim())} placeholder="bobmorek" />
+            <Field label="Repo" value={gh.repo || ""} onChange={(v) => set("repo", v.trim())} placeholder="Gyllyslsc" />
+            <Field label="Branch" value={gh.branch || ""} onChange={(v) => set("branch", v.trim())} placeholder="main" />
+          </div>
+          <Field label="Access token" type="password" value={gh.token || ""} onChange={(v) => set("token", v.trim())} placeholder="github_pat_…" />
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={onSync} style={btnPrimary}>Save settings &amp; sync</button>
+            {gh.token && <button onClick={() => onChange({ ...gh, token: "" })} style={btn}>Forget token</button>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---- App -------------------------------------------------------------------
 
 function App() {
@@ -306,32 +456,73 @@ function App() {
   const [wxError, setWxError] = useState(null);
   const [tideKey, setTideKey] = useState(() => { try { return window.localStorage.getItem(TIDE_KEY_LS) || DEFAULT_TIDE_KEY; } catch { return DEFAULT_TIDE_KEY; } });
   const [tideInfo, setTideInfo] = useState(null);
+  const [gh, setGh] = useState(loadGh);
+  const [recSha, setRecSha] = useState(null);   // GitHub blob sha of the open record
+  const [saveMsg, setSaveMsg] = useState(null);  // {kind, msg}
+  const [syncMsg, setSyncMsg] = useState(null);  // {kind, n, msg}
 
   const saveTideKey = (k) => { setTideKey(k); try { window.localStorage.setItem(TIDE_KEY_LS, k); } catch {} };
+  const saveGh = (next) => { setGh(next); try { LS.setItem(GH_LS, JSON.stringify(next)); } catch {} };
 
-  useEffect(() => { loadIndex().then((i) => { setIndex(i); setLoading(false); }); }, []);
+  // Load records: from GitHub when configured (merged into the local cache), else local only.
+  const syncFromGh = useCallback(async (cfg) => {
+    const g = cfg || gh;
+    if (!ghConfigured(g)) { setIndex(await loadIndex()); return; }
+    setSyncMsg({ kind: "loading" });
+    try {
+      const recs = await ghListRecords(g);
+      for (const rec of recs) await saveRecord(rec);
+      setIndex(await loadIndex());
+      setSyncMsg({ kind: "ok", n: recs.length });
+    } catch (e) {
+      setSyncMsg({ kind: "error", msg: e.message || String(e) });
+      setIndex(await loadIndex());
+    }
+  }, [gh]);
+
+  useEffect(() => { syncFromGh(gh).finally(() => setLoading(false)); }, []);
 
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const setMap = (group, key, v) => setForm((f) => ({ ...f, [group]: { ...f[group], [key]: v } }));
 
-  const newForm = () => { setForm(blankForm()); setRecId(null); setSavedAt(null); setPage(1); setView("form"); };
+  const newForm = () => { setForm(blankForm()); setRecId(null); setRecSha(null); setSavedAt(null); setSaveMsg(null); setPage(1); setView("form"); };
 
   const openRecord = async (id) => {
     const rec = await loadRecord(id);
-    if (rec) { setForm(rec.form); setRecId(id); setSavedAt(rec.updated); setPage(1); setView("form"); }
+    if (rec) { setForm(rec.form); setRecId(id); setRecSha(rec._sha || null); setSavedAt(rec.updated); setSaveMsg(null); setPage(1); setView("form"); }
   };
 
   const doSave = useCallback(async () => {
     const id = recId || `${Date.now()}`;
     const updated = new Date().toISOString();
-    const next = await saveRecord({ id, form, updated });
-    setIndex(next); setRecId(id); setSavedAt(updated);
-  }, [form, recId]);
+    const rec = { id, form, updated, _sha: recSha || undefined };
+    await saveRecord(rec);                 // always cache locally (offline fallback)
+    setRecId(id); setSavedAt(updated);
+    if (ghConfigured(gh)) {
+      setSaveMsg({ kind: "saving" });
+      try {
+        const sha = await ghPutRecord(gh, rec);
+        rec._sha = sha; setRecSha(sha);
+        await saveRecord(rec);             // remember the new sha for the next update
+        setSaveMsg({ kind: "github" });
+      } catch (e) {
+        setSaveMsg({ kind: "local-only", msg: e.message || String(e) });
+      }
+    } else {
+      setSaveMsg({ kind: "local" });
+    }
+    setIndex(await loadIndex());
+  }, [form, recId, recSha, gh]);
 
   const doDelete = async (id, e) => {
     e.stopPropagation();
     if (!window.confirm("Delete this risk assessment?")) return;
+    const rec = await loadRecord(id);
     setIndex(await deleteRecord(id));
+    if (rec && ghConfigured(gh)) {
+      try { await ghDeleteRecord(gh, rec); }
+      catch (err) { setSyncMsg({ kind: "error", msg: `Deleted locally, but GitHub delete failed: ${err.message || err}` }); }
+    }
   };
 
   const addHazard = () => set("hazards", [...form.hazards, { hazards: "", controls: "", likelihood: "", severity: "", rating: "" }]);
@@ -400,6 +591,8 @@ function App() {
             </button>
           </div>
 
+          <GitHubSync gh={gh} onChange={saveGh} onSync={() => syncFromGh()} syncMsg={syncMsg} />
+
           {loading ? (
             <p style={{ color: "#6b7684" }}>Loading…</p>
           ) : index.length === 0 ? (
@@ -449,12 +642,12 @@ function App() {
                 {stopCount > 0 ? `${stopCount} STOP` : `${changeCount} action(s) required`}
               </span>
             )}
-            {savedAt && <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: COLORS.green }}><CheckCircle2 size={14} /> Saved</span>}
+            <SaveStatus saveMsg={saveMsg} savedAt={savedAt} />
             <button onClick={() => window.print()} style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: "1.5px solid #dde3ec", color: COLORS.navy, padding: "8px 14px", borderRadius: 9, fontSize: 13.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
               <Printer size={16} /> Print
             </button>
-            <button onClick={doSave} style={{ display: "flex", alignItems: "center", gap: 6, background: COLORS.navy, color: "#fff", border: "none", padding: "8px 16px", borderRadius: 9, fontSize: 13.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
-              <Save size={16} /> Save
+            <button onClick={doSave} disabled={saveMsg?.kind === "saving"} style={{ display: "flex", alignItems: "center", gap: 6, background: COLORS.navy, color: "#fff", border: "none", padding: "8px 16px", borderRadius: 9, fontSize: 13.5, fontWeight: 700, cursor: saveMsg?.kind === "saving" ? "wait" : "pointer", fontFamily: "inherit", opacity: saveMsg?.kind === "saving" ? 0.7 : 1 }}>
+              <Save size={16} /> {saveMsg?.kind === "saving" ? "Saving…" : "Save"}
             </button>
           </div>
         </div>
