@@ -9,9 +9,14 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
   body { font-family: 'Aptos','Segoe UI','Calibri','Helvetica',sans-serif; }
+  .print-only { display: none; }
   @media print {
+    @page { size: A4; margin: 12mm 11mm; }
+    html, body { background: #fff !important; }
     .no-print { display: none !important; }
-    body { background: #fff !important; }
+    .print-only { display: block !important; }
+    .pd-section, .pd-row { break-inside: avoid; page-break-inside: avoid; }
+    .pd-pagebreak { break-before: page; page-break-before: always; }
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
@@ -441,6 +446,144 @@ function GitHubSync({ gh, onChange, onSync, syncMsg }) {
   );
 }
 
+// ---- Print / PDF document --------------------------------------------------
+// A clean, A4-formatted rendering of the assessment shown ONLY when printing
+// (Print → "Save as PDF"). The interactive UI is hidden via .no-print, and this
+// block is revealed via .print-only, so the exported PDF is a tidy document with
+// crisp, selectable text rather than a screenshot of the web form.
+
+const pdWrap = { fontFamily: "'Segoe UI',Arial,sans-serif", color: "#1f2733", WebkitPrintColorAdjust: "exact", printColorAdjust: "exact", fontSize: 10.5 };
+const pdH = { background: COLORS.navy, color: "#fff", fontWeight: 700, fontSize: 11, padding: "4px 8px", borderRadius: 3 };
+const pdTbl = { width: "100%", borderCollapse: "collapse", fontSize: 10.5 };
+const pdTd = { border: "1px solid #ccd3de", padding: "3px 8px", verticalAlign: "top", textAlign: "left" };
+const pdTh = { ...pdTd, background: "#eef1f6", fontWeight: 700, fontSize: 9.5 };
+const pdRemark = { fontSize: 10, color: "#333", padding: "4px 2px", whiteSpace: "pre-wrap" };
+const RATING_COLOR = { Stop: COLORS.red, Change: "#E67E22", Caution: "#8a6d00" };
+
+function PdVal({ v }) {
+  if (!v) return <span style={{ color: "#9aa5b1" }}>—</span>;
+  return <span style={{ fontWeight: 700, color: RATING_COLOR[v] || "#1f2733" }}>{v}</span>;
+}
+function PdRisk({ title, labels, map = {}, remarks }) {
+  return (
+    <div className="pd-section" style={{ marginTop: 9 }}>
+      <div style={pdH}>{title}</div>
+      <table style={pdTbl}><tbody>
+        {labels.map((l) => (
+          <tr key={l} className="pd-row">
+            <td style={pdTd}>{l}</td>
+            <td style={{ ...pdTd, width: 84, textAlign: "right" }}><PdVal v={map[l]} /></td>
+          </tr>
+        ))}
+      </tbody></table>
+      {remarks ? <div style={pdRemark}><b>Remarks:</b> {remarks}</div> : null}
+    </div>
+  );
+}
+function PdYesNo({ title, labels, map = {} }) {
+  return (
+    <div className="pd-section" style={{ marginTop: 9 }}>
+      <div style={pdH}>{title}</div>
+      <table style={pdTbl}><tbody>
+        {labels.map((l) => (
+          <tr key={l} className="pd-row">
+            <td style={pdTd}>{l}</td>
+            <td style={{ ...pdTd, width: 64, textAlign: "right", fontWeight: 700 }}>{map[l] || "—"}</td>
+          </tr>
+        ))}
+      </tbody></table>
+    </div>
+  );
+}
+
+function PrintDoc({ form: f }) {
+  const stop = ["water", "beach", "other"].reduce((n, g) => n + Object.values(f[g] || {}).filter((v) => v === "Stop").length, 0);
+  const change = ["water", "beach", "other"].reduce((n, g) => n + Object.values(f[g] || {}).filter((v) => v === "Change").length, 0);
+  const acts = [...(f.activities || []), f.activityOther].filter(Boolean).join(", ");
+  const field = (label, val) => (
+    <div>
+      <span style={{ color: "#6b7684", fontWeight: 700, textTransform: "uppercase", fontSize: 8.5, letterSpacing: ".04em", display: "block" }}>{label}</span>
+      {val || "—"}
+    </div>
+  );
+  const verdict = stop > 0 ? { t: `DO NOT PROCEED — ${stop} STOP`, c: COLORS.red } : change > 0 ? { t: `${change} action(s) required before proceeding`, c: "#b9770e" } : { t: "No stop/change flags recorded", c: COLORS.green };
+  return (
+    <div className="print-only" style={pdWrap}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, borderBottom: `2px solid ${COLORS.navy}`, paddingBottom: 8 }}>
+        <img src={GYLLY_LOGO} alt="" style={{ height: 40 }} />
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 16, fontWeight: 800, color: COLORS.navy }}>SLSGB Analytical Risk Assessment</div>
+          <div style={{ fontSize: 10, color: "#6b7684" }}>Gyllyngvase SLSC · Falmouth · session safety record</div>
+        </div>
+        <div style={{ textAlign: "right", fontSize: 10 }}>
+          <div><b>RA No:</b> {f.raNo || "—"}</div>
+          <div><b>Date:</b> {f.date || "—"}</div>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8, marginTop: 8 }}>
+        {field("Session time", f.sessionTime)}
+        {field("Location", f.location)}
+        {field("Trainer/Coach", f.trainer)}
+        {field("Lifeguard/First Aider", f.lifeguard)}
+        {field("High tide", [f.highTide, f.highHeight && `${f.highHeight}m`].filter(Boolean).join(" · "))}
+        {field("Low tide", [f.lowTide, f.lowHeight && `${f.lowHeight}m`].filter(Boolean).join(" · "))}
+        {field("Activities", acts)}
+        {field("Auto assessment", <span style={{ color: verdict.c, fontWeight: 700 }}>{verdict.t}</span>)}
+      </div>
+
+      <PdRisk title="Water State — Adverse Effect on Safety" labels={WATER_STATE} map={f.water} remarks={f.waterRemarks} />
+      <PdYesNo title="Equipment — Positive Effect on Safety" labels={EQUIPMENT} map={f.equipment} />
+      <PdRisk title="Beach State — Adverse Effect on Safety" labels={BEACH_STATE} map={f.beach} remarks={f.beachRemarks} />
+      <PdYesNo title="Safety Cover — Positive Effect on Safety" labels={SAFETY_COVER} map={f.safetyCover} />
+      <PdRisk title="Other Risks — Adverse Effect on Safety" labels={OTHER_RISKS} map={f.other} remarks={f.otherRemarks} />
+      <PdYesNo title="Participant Capabilities" labels={PARTICIPANTS} map={f.participants} />
+
+      <div className="pd-section" style={{ marginTop: 9 }}>
+        <div style={pdH}>Pre-Session Checklist</div>
+        <table style={pdTbl}><tbody>
+          {CHECKLIST_LEFT.map((l, i) => (
+            <tr key={l} className="pd-row">
+              <td style={pdTd}>{l}</td><td style={{ ...pdTd, width: 46, textAlign: "center", fontWeight: 700 }}>{f.checkLeft[l] || "—"}</td>
+              <td style={pdTd}>{CHECKLIST_RIGHT[i]}</td><td style={{ ...pdTd, width: 46, textAlign: "center", fontWeight: 700 }}>{f.checkRight[CHECKLIST_RIGHT[i]] || "—"}</td>
+            </tr>
+          ))}
+        </tbody></table>
+      </div>
+
+      <div className="pd-section pd-pagebreak" style={{ marginTop: 9 }}>
+        <div style={pdH}>Hazards &amp; Additional Control Measures</div>
+        <table style={pdTbl}><tbody>
+          <tr><th style={{ ...pdTh, width: 22 }}>#</th><th style={pdTh}>Hazards involved</th><th style={pdTh}>Additional control measures</th><th style={{ ...pdTh, width: 64 }}>Likelihood</th><th style={{ ...pdTh, width: 64 }}>Severity</th><th style={{ ...pdTh, width: 54 }}>Rating</th></tr>
+          {(f.hazards || []).map((h, i) => (
+            <tr key={i} className="pd-row">
+              <td style={{ ...pdTd, textAlign: "center" }}>{i + 1}</td>
+              <td style={pdTd}>{h.hazards || "—"}</td>
+              <td style={pdTd}>{h.controls || "—"}</td>
+              <td style={pdTd}>{h.likelihood || "—"}</td>
+              <td style={pdTd}>{h.severity || "—"}</td>
+              <td style={{ ...pdTd, fontWeight: 700 }}>{h.rating || "—"}</td>
+            </tr>
+          ))}
+        </tbody></table>
+      </div>
+
+      {(f.addComments || f.addAction) && (
+        <div className="pd-section" style={{ marginTop: 9 }}>
+          <div style={pdH}>Additional Comments &amp; Actions</div>
+          {f.addComments ? <div style={pdRemark}><b>Comments:</b> {f.addComments}</div> : null}
+          {f.addAction ? <div style={pdRemark}><b>Action required:</b> {f.addAction}</div> : null}
+        </div>
+      )}
+
+      <div style={{ marginTop: 16, display: "flex", justifyContent: "space-between", alignItems: "flex-end", fontSize: 10.5, borderTop: "1px solid #ccd3de", paddingTop: 8 }}>
+        <div><b>Trainer/Coach signature:</b> {f.trainerSig || "______________________"}</div>
+        <div style={{ color: "#6b7684" }}>Gyllyngvase SLSC</div>
+      </div>
+    </div>
+  );
+}
+
 // ---- App -------------------------------------------------------------------
 
 function App() {
@@ -628,7 +771,8 @@ function App() {
 
   // ---------- FORM VIEW ----------
   return (
-    <div style={wrap}>
+    <>
+    <div className="no-print" style={wrap}>
       <Header />
       <div style={{ position: "sticky", top: 0, zIndex: 20, background: "#fff", borderBottom: "1px solid #e6eaf1", boxShadow: "0 2px 8px rgba(8,20,92,.05)" }}>
         <div style={{ maxWidth: 980, margin: "0 auto", padding: "12px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
@@ -643,8 +787,8 @@ function App() {
               </span>
             )}
             <SaveStatus saveMsg={saveMsg} savedAt={savedAt} />
-            <button onClick={() => window.print()} style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: "1.5px solid #dde3ec", color: COLORS.navy, padding: "8px 14px", borderRadius: 9, fontSize: 13.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
-              <Printer size={16} /> Print
+            <button onClick={() => window.print()} title="Opens the print dialog — choose “Save as PDF” as the destination" style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: "1.5px solid #dde3ec", color: COLORS.navy, padding: "8px 14px", borderRadius: 9, fontSize: 13.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+              <FileText size={16} /> PDF / Print
             </button>
             <button onClick={doSave} disabled={saveMsg?.kind === "saving"} style={{ display: "flex", alignItems: "center", gap: 6, background: COLORS.navy, color: "#fff", border: "none", padding: "8px 16px", borderRadius: 9, fontSize: 13.5, fontWeight: 700, cursor: saveMsg?.kind === "saving" ? "wait" : "pointer", fontFamily: "inherit", opacity: saveMsg?.kind === "saving" ? 0.7 : 1 }}>
               <Save size={16} /> {saveMsg?.kind === "saving" ? "Saving…" : "Save"}
@@ -770,6 +914,8 @@ function App() {
         )}
       </div>
     </div>
+    <PrintDoc form={form} />
+    </>
   );
 }
 
