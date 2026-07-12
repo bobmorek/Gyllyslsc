@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SLSGB Analytical Risk Assessment</title>
+<link rel="preconnect" href="https://unpkg.com" />
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { font-family: 'Aptos','Segoe UI','Calibri','Helvetica',sans-serif; }
+  @media print {
+    .no-print { display: none !important; }
+    body { background: #fff !important; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/lucide@1.17.0/dist/umd/lucide.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback } = React;
+
+// --- Lucide icon shim: wrap lucide's icon nodes as React components ---
+function makeIcon(iconName) {
+  return function Icon({ size = 24, color = "currentColor", style = {} }) {
+    const children = lucide[iconName]; // array of [tag, attrs] pairs
+    if (!children) return null;
+    const childEls = children.map((c, i) =>
+      React.createElement(c[0], { key: i, ...c[1] })
+    );
+    return React.createElement("svg", {
+      xmlns: "http://www.w3.org/2000/svg",
+      width: size, height: size, viewBox: "0 0 24 24",
+      fill: "none", stroke: color, strokeWidth: 2,
+      strokeLinecap: "round", strokeLinejoin: "round", style,
+    }, ...childEls);
+  };
+}
+const ICON_NAMES = ["Waves", "Plus", "Trash2", "Save", "FileText", "ArrowLeft", "Printer", "AlertTriangle", "CheckCircle2", "Clock", "CloudSun", "RefreshCw", "Wind", "Droplets"];
+const ICONS = {};
+ICON_NAMES.forEach((n) => { ICONS[n] = makeIcon(n); });
+const { Waves, Plus, Trash2, Save, FileText, ArrowLeft, Printer, AlertTriangle, CheckCircle2, Clock, CloudSun, RefreshCw, Wind, Droplets } = ICONS;
+
+
+// Gyllyngvase Beach, Falmouth
+const GYLLYNGVASE = { lat: 50.1432, lon: -5.0682 };
+const TIDE_KEY_LS = "ra:worldtides_key";
+const DEFAULT_TIDE_KEY = "815d5dbc-a143-4092-911b-ee373cca28fb";
+
+async function fetchTides(apiKey) {
+  if (!apiKey) return null;
+  const { lat, lon } = GYLLYNGVASE;
+  // Datum CD (Chart Datum) so heights match Admiralty tide tables; localtime for BST/GMT-correct times
+  const url = `https://www.worldtides.info/api/v3?extremes&date=today&days=2&datum=CD&localtime&lat=${lat}&lon=${lon}&key=${encodeURIComponent(apiKey)}`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  const now = Date.now();
+  const future = (j.extremes || []).filter((e) => e.dt * 1000 >= now - 30 * 60 * 1000);
+  const nextHigh = future.find((e) => /high/i.test(e.type));
+  const nextLow = future.find((e) => /low/i.test(e.type));
+  const fmt = (e) => e ? new Date(e.dt * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "";
+  return {
+    highTime: fmt(nextHigh), highHeight: nextHigh ? nextHigh.height.toFixed(2) : "",
+    lowTime: fmt(nextLow), lowHeight: nextLow ? nextLow.height.toFixed(2) : "",
+    station: j.station || "",
+  };
+}
+const DEG_TO_COMPASS = (d) => {
+  const dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+  return dirs[Math.round(d / 22.5) % 16];
+};
+// Auto risk band helpers (conservative — for guidance only, coach overrides)
+const swellBand = (m) => (m == null ? "" : m >= 2 ? "Stop" : m >= 1.2 ? "Change" : m >= 0.6 ? "Caution" : "NA");
+const windBand = (kmh) => (kmh == null ? "" : kmh >= 50 ? "Stop" : kmh >= 35 ? "Change" : kmh >= 20 ? "Caution" : "NA");
+
+async function getJSON(url) {
+  const r = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+async function fetchLiveConditions() {
+  const { lat, lon } = GYLLYNGVASE;
+  const marineUrl = `https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&current=wave_height,wave_direction,wave_period,swell_wave_height,swell_wave_period,swell_wave_direction&timezone=Europe%2FLondon`;
+  const wxUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,weather_code,visibility&wind_speed_unit=kmh&timezone=Europe%2FLondon`;
+
+  // Run independently so one failing endpoint doesn't sink the other.
+  const [mRes, wRes] = await Promise.allSettled([getJSON(marineUrl), getJSON(wxUrl)]);
+
+  if (mRes.status === "rejected" && wRes.status === "rejected") {
+    throw new Error(`weather: ${wRes.reason?.message || wRes.reason}; marine: ${mRes.reason?.message || mRes.reason}`);
+  }
+  const m = mRes.status === "fulfilled" ? mRes.value : null;
+  const w = wRes.status === "fulfilled" ? wRes.value : null;
+
+  return {
+    marineOk: !!m, weatherOk: !!w,
+    waveHeight: m?.current?.wave_height,
+    wavePeriod: m?.current?.wave_period,
+    swellHeight: m?.current?.swell_wave_height,
+    swellPeriod: m?.current?.swell_wave_period,
+    waveDir: m?.current?.wave_direction,
+    swellDir: m?.current?.swell_wave_direction,
+    temp: w?.current?.temperature_2m,
+    windSpeed: w?.current?.wind_speed_10m,
+    windGust: w?.current?.wind_gusts_10m,
+    windDir: w?.current?.wind_direction_10m,
+    weatherCode: w?.current?.weather_code,
+    visibility: w?.current?.visibility,
+    time: w?.current?.time || m?.current?.time,
+  };
+}
+
+const WX_DESC = {
+  0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+  45: "Fog", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
+  61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Freezing rain", 67: "Freezing rain",
+  71: "Light snow", 73: "Snow", 75: "Heavy snow", 80: "Rain showers", 81: "Rain showers",
+  82: "Violent showers", 95: "Thunderstorm", 96: "Thunderstorm + hail", 99: "Thunderstorm + hail",
+};
+
+// ---- Form schema ----------------------------------------------------------
+
+const ACTIVITIES = [
+  "Surf Swimming", "Board Paddling", "Ski Paddling", "Surf Boat",
+  "Beach", "IRB", "Beach Activities & Running",
+];
+
+const RISK_OPTS = ["NA", "Caution", "Change", "Stop"];
+
+const WATER_STATE = ["Swell Size", "Wave Type", "Depth of Water", "Tides/Rip Currents", "Wind direction & strength", "Other (specify)"];
+const BEACH_STATE = ["Beach Conditions", "Headland, Groynes etc", "Seaweed/Debris", "Rocks, stones, sand type", "Water Quality", "Other (specify)"];
+const OTHER_RISKS = ["Weather", "Visibility/Available light", "Sun exposure heat/cold", "Other beach/water users", "Endurance session", "Speed session", "Other (specify)"];
+
+const EQUIPMENT = ["Wetsuits or other buoyancy aid", "Floating equipment", "Leash", "Within 400m of shore", "Flare/whistle/radio/phone (>400m from shore)", "Other (specify)"];
+const SAFETY_COVER = ["Lifeguard/Lifesaver Patrol on duty", "Specific Qualified Safety/First Aid Cover", "Rescue tubes/rescue boards", "IRB's/RWC's", "Communication (radio/whistle/PA system)", "Access to Emergency Services"];
+const PARTICIPANTS = ["Novice (able to swim 50m)", "Competent (skill level 1-2/SLSGB lifeguard)", "Regional level competitor (skill level 3)", "National level competitor (skill level 4)", "International level competitor (skill level 5)", "Support for participants with specific needs", "Other (specify)"];
+
+const CHECKLIST_LEFT = ["Safety briefing completed", "Participant profile sheets complete?", "Equipment and clothing appropriate?", "Safety cover and controls in place?"];
+const CHECKLIST_RIGHT = ["Additional Actions completed?", "PAR-Q form complete for over 18's?", "Participant readiness sufficient?", "Register completed?"];
+
+const RATING = ["Low", "Medium", "High"];
+const LIKE_SEV = ["1 - Very Unlikely", "2 - Unlikely", "3 - Possible", "4 - Likely", "5 - Very Likely"];
+
+// Gyllyngvase SLSC palette: main colour sapphire; green, yellow, navy & white secondary.
+// (Per gyllysurf.org.uk.) SLSGB accent: lifesaving red for STOP.
+const COLORS = {
+  navy: "#0A2342",      // deep navy — headers / base
+  sapphire: "#0F52BA",  // club primary
+  mid: "#2E6FD6",       // mid sapphire — secondary / links, water graphics
+  zissou: "#5BB6E0",    // light blue — sea fills
+  green: "#1F8A4C",      // club green — positive / safe
+  yellow: "#FFC72C",    // club yellow — caution
+  red: "#D81E2C",       // SLSGB lifesaving red — stop / alert
+  sand: "#E8D9A8",      // Gyllyngvase sand
+};
+
+function blankForm() {
+  return {
+    raNo: "", date: new Date().toISOString().slice(0, 10), sessionTime: "", location: "",
+    activities: [], activityOther: "",
+    trainer: "", lifeguard: "",
+    highTide: "", highHeight: "", lowTide: "", lowHeight: "",
+    water: {}, waterOther: "", waterRemarks: "",
+    beach: {}, beachOther: "", beachRemarks: "",
+    other: {}, otherOther: "", otherRemarks: "",
+    equipment: {}, safetyCover: {}, participants: {},
+    checkLeft: {}, checkRight: {},
+    trainerSig: "",
+    hazards: [{ hazards: "", controls: "", likelihood: "", severity: "", rating: "" }],
+    addComments: "", addAction: "",
+  };
+}
+
+// ---- Persistence (browser localStorage) ------------------------------------
+
+const LS = window.localStorage;
+async function loadIndex() {
+  try { const r = LS.getItem("ra:index"); return r ? JSON.parse(r) : []; } catch { return []; }
+}
+async function saveRecord(rec) {
+  LS.setItem(`ra:rec:${rec.id}`, JSON.stringify(rec));
+  const idx = await loadIndex();
+  const meta = { id: rec.id, raNo: rec.form.raNo, location: rec.form.location, date: rec.form.date, updated: rec.updated };
+  const next = [meta, ...idx.filter((m) => m.id !== rec.id)];
+  LS.setItem("ra:index", JSON.stringify(next));
+  return next;
+}
+async function loadRecord(id) {
+  const r = LS.getItem(`ra:rec:${id}`); return r ? JSON.parse(r) : null;
+}
+async function deleteRecord(id) {
+  LS.removeItem(`ra:rec:${id}`);
+  const idx = await loadIndex();
+  const next = idx.filter((m) => m.id !== id);
+  LS.setItem("ra:index", JSON.stringify(next));
+  return next;
+}
+
+// ---- Small UI pieces -------------------------------------------------------
+
+const optColor = (v) =>
+  v === "Stop" ? COLORS.red : v === "Change" ? "#E67E22" : v === "Caution" ? COLORS.yellow : "#9aa5b1";
+
+function RiskRow({ label, value, onChange }) {
+  const isOther = label.includes("Other");
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: "1px solid #eef1f6" }}>
+      <span style={{ fontSize: 13.5, color: "#1f2733" }}>{label}</span>
+      <div style={{ display: "flex", gap: 5 }}>
+        {RISK_OPTS.map((o) => {
+          const on = value === o;
+          return (
+            <button key={o} onClick={() => onChange(on ? "" : o)}
+              style={{
+                fontSize: 11, fontWeight: 600, padding: "4px 9px", borderRadius: 6, cursor: "pointer",
+                border: on ? `1.5px solid ${optColor(o)}` : "1.5px solid #dde3ec",
+                background: on ? optColor(o) : "#fff",
+                color: on ? (o === "Caution" ? "#3a2f00" : "#fff") : "#6b7684",
+                transition: "all .12s",
+              }}>{o}</button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function YesNoRow({ label, value, onChange, na = true }) {
+  const opts = na ? ["Yes", "No", "NA"] : ["Yes", "No"];
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: "1px solid #eef1f6" }}>
+      <span style={{ fontSize: 13.5, color: "#1f2733" }}>{label}</span>
+      <div style={{ display: "flex", gap: 5 }}>
+        {opts.map((o) => {
+          const on = value === o;
+          const c = o === "Yes" ? COLORS.green : o === "No" ? COLORS.red : "#9aa5b1";
+          return (
+            <button key={o} onClick={() => onChange(on ? "" : o)}
+              style={{
+                fontSize: 11.5, fontWeight: 600, padding: "4px 12px", borderRadius: 6, cursor: "pointer",
+                border: on ? `1.5px solid ${c}` : "1.5px solid #dde3ec",
+                background: on ? c : "#fff", color: on ? "#fff" : "#6b7684", transition: "all .12s",
+              }}>{o}</button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+const inputStyle = {
+  width: "100%", padding: "9px 11px", border: "1.5px solid #dde3ec", borderRadius: 8,
+  fontSize: 14, color: "#1f2733", background: "#fff", boxSizing: "border-box", fontFamily: "inherit",
+};
+
+function Field({ label, value, onChange, type = "text", placeholder }) {
+  return (
+    <label style={{ display: "block" }}>
+      <span style={{ display: "block", fontSize: 11.5, fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase", color: COLORS.navy, marginBottom: 5 }}>{label}</span>
+      <input type={type} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} style={inputStyle} />
+    </label>
+  );
+}
+
+function SectionCard({ title, accent, children }) {
+  return (
+    <div style={{ background: "#fff", borderRadius: 14, border: "1px solid #e6eaf1", overflow: "hidden", boxShadow: "0 1px 3px rgba(8,20,92,.04)" }}>
+      <div style={{ padding: "12px 18px", background: accent || COLORS.navy, display: "flex", alignItems: "center", gap: 9 }}>
+        <h3 style={{ margin: 0, fontSize: 14.5, fontWeight: 700, color: "#fff", letterSpacing: ".01em" }}>{title}</h3>
+      </div>
+      <div style={{ padding: "16px 18px" }}>{children}</div>
+    </div>
+  );
+}
+
+// ---- App -------------------------------------------------------------------
+
+function App() {
+  const [view, setView] = useState("list"); // list | form
+  const [index, setIndex] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [form, setForm] = useState(blankForm());
+  const [recId, setRecId] = useState(null);
+  const [savedAt, setSavedAt] = useState(null);
+  const [page, setPage] = useState(1);
+  const [wx, setWx] = useState(null);
+  const [wxLoading, setWxLoading] = useState(false);
+  const [wxError, setWxError] = useState(null);
+  const [tideKey, setTideKey] = useState(() => { try { return window.localStorage.getItem(TIDE_KEY_LS) || DEFAULT_TIDE_KEY; } catch { return DEFAULT_TIDE_KEY; } });
+  const [tideInfo, setTideInfo] = useState(null);
+
+  const saveTideKey = (k) => { setTideKey(k); try { window.localStorage.setItem(TIDE_KEY_LS, k); } catch {} };
+
+  useEffect(() => { loadIndex().then((i) => { setIndex(i); setLoading(false); }); }, []);
+
+  const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  const setMap = (group, key, v) => setForm((f) => ({ ...f, [group]: { ...f[group], [key]: v } }));
+
+  const newForm = () => { setForm(blankForm()); setRecId(null); setSavedAt(null); setPage(1); setView("form"); };
+
+  const openRecord = async (id) => {
+    const rec = await loadRecord(id);
+    if (rec) { setForm(rec.form); setRecId(id); setSavedAt(rec.updated); setPage(1); setView("form"); }
+  };
+
+  const doSave = useCallback(async () => {
+    const id = recId || `${Date.now()}`;
+    const updated = new Date().toISOString();
+    const next = await saveRecord({ id, form, updated });
+    setIndex(next); setRecId(id); setSavedAt(updated);
+  }, [form, recId]);
+
+  const doDelete = async (id, e) => {
+    e.stopPropagation();
+    if (!window.confirm("Delete this risk assessment?")) return;
+    setIndex(await deleteRecord(id));
+  };
+
+  const addHazard = () => set("hazards", [...form.hazards, { hazards: "", controls: "", likelihood: "", severity: "", rating: "" }]);
+  const setHazard = (i, k, v) => set("hazards", form.hazards.map((h, j) => (j === i ? { ...h, [k]: v } : h)));
+  const rmHazard = (i) => set("hazards", form.hazards.filter((_, j) => j !== i));
+
+  const getLive = async () => {
+    setWxLoading(true); setWxError(null);
+    try {
+      const [d, tides] = await Promise.all([
+        fetchLiveConditions(),
+        fetchTides(tideKey).catch((e) => ({ tideError: e.message || String(e) })),
+      ]);
+      setWx(d);
+      if (tides && !tides.tideError) setTideInfo(tides); else if (tides?.tideError) setTideInfo({ error: tides.tideError });
+      const remarkBits = [];
+      if (d.swellHeight != null) remarkBits.push(`Swell ${d.swellHeight}m @ ${d.swellPeriod ?? "?"}s`);
+      if (d.waveHeight != null) remarkBits.push(`Wave ${d.waveHeight}m`);
+      if (d.windSpeed != null) remarkBits.push(`Wind ${Math.round(d.windSpeed)}km/h ${d.windDir != null ? DEG_TO_COMPASS(d.windDir) : ""} (gust ${Math.round(d.windGust ?? 0)})`);
+      const stamp = d.time ? new Date(d.time).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "short" }) : "";
+      const t = tides && !tides.tideError ? tides : null;
+      setForm((f) => ({
+        ...f,
+        highTide: t?.highTime || f.highTide,
+        highHeight: t?.highHeight || f.highHeight,
+        lowTide: t?.lowTime || f.lowTide,
+        lowHeight: t?.lowHeight || f.lowHeight,
+        water: {
+          ...f.water,
+          "Swell Size": swellBand(d.swellHeight ?? d.waveHeight) || f.water["Swell Size"],
+          "Wind direction & strength": windBand(d.windSpeed) || f.water["Wind direction & strength"],
+        },
+        waterRemarks: `${remarkBits.join("  ·  ")}${stamp ? `  ·  Open-Meteo @ ${stamp}` : ""}${f.waterRemarks ? `\n${f.waterRemarks}` : ""}`,
+        other: {
+          ...f.other,
+          "Weather": d.weatherCode >= 80 ? "Change" : d.weatherCode >= 45 ? "Caution" : f.other["Weather"],
+          "Visibility/Available light": d.visibility != null && d.visibility < 2000 ? "Caution" : f.other["Visibility/Available light"],
+        },
+        otherRemarks: `${WX_DESC[d.weatherCode] ?? "Conditions"}, ${d.temp != null ? Math.round(d.temp) + "°C" : ""}${d.visibility != null ? `, visibility ~${(d.visibility / 1000).toFixed(1)}km` : ""}${f.otherRemarks ? `\n${f.otherRemarks}` : ""}`,
+      }));
+    } catch (e) {
+      setWxError(`Couldn't reach the weather service (${e.message || e}). Check your internet connection and try again, or enter conditions manually.`);
+    } finally {
+      setWxLoading(false);
+    }
+  };
+
+  const stopCount = ["water", "beach", "other"].reduce((n, g) => n + Object.values(form[g]).filter((v) => v === "Stop").length, 0);
+  const changeCount = ["water", "beach", "other"].reduce((n, g) => n + Object.values(form[g]).filter((v) => v === "Change").length, 0);
+
+  const wrap = { fontFamily: "'Aptos','Segoe UI','Calibri','Helvetica',sans-serif", background: "#f4f6fa", minHeight: "100vh", color: "#1f2733" };
+
+  // ---------- LIST VIEW ----------
+  if (view === "list") {
+    return (
+      <div style={wrap}>
+        <Header />
+        <div style={{ maxWidth: 980, margin: "0 auto", padding: "28px 20px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 22 }}>
+            <div>
+              <h2 style={{ margin: 0, fontSize: 24, fontWeight: 800, color: COLORS.navy }}>Risk Assessments</h2>
+              <p style={{ margin: "4px 0 0", color: "#6b7684", fontSize: 14 }}>Saved records ({index.length})</p>
+            </div>
+            <button onClick={newForm} style={{ display: "flex", alignItems: "center", gap: 8, background: COLORS.navy, color: "#fff", border: "none", padding: "12px 18px", borderRadius: 10, fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
+              <Plus size={18} /> New Assessment
+            </button>
+          </div>
+
+          {loading ? (
+            <p style={{ color: "#6b7684" }}>Loading…</p>
+          ) : index.length === 0 ? (
+            <div style={{ textAlign: "center", padding: "60px 20px", background: "#fff", borderRadius: 16, border: "1px dashed #cfd8e6" }}>
+              <img src={GYLLY_LOGO} alt="Gyllyngvase SLSC" style={{ height: 56, width: "auto", display: "inline-block", opacity: .9 }} />
+              <p style={{ color: "#6b7684", margin: "16px 0 0", fontSize: 15 }}>No assessments yet. Create your first one.</p>
+            </div>
+          ) : (
+            <div style={{ display: "grid", gap: 12 }}>
+              {index.map((m) => (
+                <div key={m.id} onClick={() => openRecord(m.id)}
+                  style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "#fff", borderRadius: 12, border: "1px solid #e6eaf1", padding: "16px 20px", cursor: "pointer", boxShadow: "0 1px 3px rgba(8,20,92,.04)" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+                    <div style={{ width: 44, height: 44, borderRadius: 10, background: COLORS.zissou + "22", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      <FileText size={22} color={COLORS.mid} />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 16, fontWeight: 700, color: COLORS.navy }}>{m.location || "Untitled location"}</div>
+                      <div style={{ fontSize: 13, color: "#6b7684" }}>RA No: {m.raNo || "—"} · {m.date || "no date"}</div>
+                    </div>
+                  </div>
+                  <button onClick={(e) => doDelete(m.id, e)} style={{ background: "none", border: "none", cursor: "pointer", color: "#c0392b", padding: 8 }}>
+                    <Trash2 size={18} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ---------- FORM VIEW ----------
+  return (
+    <div style={wrap}>
+      <Header />
+      <div style={{ position: "sticky", top: 0, zIndex: 20, background: "#fff", borderBottom: "1px solid #e6eaf1", boxShadow: "0 2px 8px rgba(8,20,92,.05)" }}>
+        <div style={{ maxWidth: 980, margin: "0 auto", padding: "12px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+          <button onClick={() => setView("list")} style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", color: COLORS.navy, fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+            <ArrowLeft size={18} /> All assessments
+          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {(stopCount > 0 || changeCount > 0) && (
+              <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, fontWeight: 700, padding: "5px 11px", borderRadius: 20, background: stopCount > 0 ? "#fdecea" : "#fef5e7", color: stopCount > 0 ? "#c0392b" : "#b9770e" }}>
+                <AlertTriangle size={14} />
+                {stopCount > 0 ? `${stopCount} STOP` : `${changeCount} action(s) required`}
+              </span>
+            )}
+            {savedAt && <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: COLORS.green }}><CheckCircle2 size={14} /> Saved</span>}
+            <button onClick={() => window.print()} style={{ display: "flex", alignItems: "center", gap: 6, background: "#fff", border: "1.5px solid #dde3ec", color: COLORS.navy, padding: "8px 14px", borderRadius: 9, fontSize: 13.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+              <Printer size={16} /> Print
+            </button>
+            <button onClick={doSave} style={{ display: "flex", alignItems: "center", gap: 6, background: COLORS.navy, color: "#fff", border: "none", padding: "8px 16px", borderRadius: 9, fontSize: 13.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
+              <Save size={16} /> Save
+            </button>
+          </div>
+        </div>
+        <div style={{ maxWidth: 980, margin: "0 auto", padding: "0 20px 12px", display: "flex", gap: 8 }}>
+          {[1, 2].map((p) => (
+            <button key={p} onClick={() => setPage(p)} style={{ flex: 1, padding: "8px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 700, background: page === p ? COLORS.mid : "#eef1f6", color: page === p ? "#fff" : "#6b7684" }}>
+              {p === 1 ? "Page 1 · Analytical Assessment" : "Page 2 · Hazards & Controls"}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 980, margin: "0 auto", padding: "22px 20px 60px", display: "grid", gap: 18 }}>
+        {page === 1 ? (
+          <>
+            <SectionCard title="Session Details">
+              <LivePanel wx={wx} loading={wxLoading} error={wxError} onFetch={getLive} tideInfo={tideInfo} tideKey={tideKey} onTideKey={saveTideKey} />
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 14 }}>
+                <Field label="Risk Assessment No" value={form.raNo} onChange={(v) => set("raNo", v)} />
+                <Field label="Date" type="date" value={form.date} onChange={(v) => set("date", v)} />
+                <Field label="Session time" value={form.sessionTime} onChange={(v) => set("sessionTime", v)} placeholder="e.g. 09:00–11:00" />
+                <Field label="Location" value={form.location} onChange={(v) => set("location", v)} />
+                <Field label="Trainer/Coach" value={form.trainer} onChange={(v) => set("trainer", v)} />
+                <Field label="Lifeguard/First Aider" value={form.lifeguard} onChange={(v) => set("lifeguard", v)} />
+                <Field label="High Tide" value={form.highTide} onChange={(v) => set("highTide", v)} placeholder="time" />
+                <Field label="High Tide Height" value={form.highHeight} onChange={(v) => set("highHeight", v)} placeholder="m" />
+                <Field label="Low Tide" value={form.lowTide} onChange={(v) => set("lowTide", v)} placeholder="time" />
+                <Field label="Low Tide Height" value={form.lowHeight} onChange={(v) => set("lowHeight", v)} placeholder="m" />
+              </div>
+              <div style={{ marginTop: 16 }}>
+                <span style={{ display: "block", fontSize: 11.5, fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase", color: COLORS.navy, marginBottom: 8 }}>Activity</span>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {ACTIVITIES.map((a) => {
+                    const on = form.activities.includes(a);
+                    return (
+                      <button key={a} onClick={() => set("activities", on ? form.activities.filter((x) => x !== a) : [...form.activities, a])}
+                        style={{ padding: "7px 13px", borderRadius: 20, fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", border: on ? `1.5px solid ${COLORS.mid}` : "1.5px solid #dde3ec", background: on ? COLORS.mid : "#fff", color: on ? "#fff" : "#6b7684" }}>
+                        {a}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div style={{ marginTop: 12 }}>
+                  <Field label="Other (please state)" value={form.activityOther} onChange={(v) => set("activityOther", v)} />
+                </div>
+              </div>
+            </SectionCard>
+
+            {/* Adverse-effect risk groups, each paired with positive-effect controls */}
+            <SectionCard title="Water State — Adverse Effect on Safety" accent={COLORS.mid}>
+              {WATER_STATE.map((l) => <RiskRow key={l} label={l} value={form.water[l]} onChange={(v) => setMap("water", l, v)} />)}
+              <Remarks value={form.waterRemarks} onChange={(v) => set("waterRemarks", v)} />
+            </SectionCard>
+
+            <PositiveCard title="Equipment — Positive Effect on Safety" items={EQUIPMENT} group="equipment" form={form} setMap={setMap} />
+
+            <SectionCard title="Beach State — Adverse Effect on Safety" accent={COLORS.mid}>
+              {BEACH_STATE.map((l) => <RiskRow key={l} label={l} value={form.beach[l]} onChange={(v) => setMap("beach", l, v)} />)}
+              <Remarks value={form.beachRemarks} onChange={(v) => set("beachRemarks", v)} />
+            </SectionCard>
+
+            <PositiveCard title="Safety Cover — Positive Effect on Safety" items={SAFETY_COVER} group="safetyCover" form={form} setMap={setMap} note="Record proximity & quantity in remarks" />
+
+            <SectionCard title="Other Risks — Adverse Effect on Safety" accent={COLORS.mid}>
+              {OTHER_RISKS.map((l) => <RiskRow key={l} label={l} value={form.other[l]} onChange={(v) => setMap("other", l, v)} />)}
+              <Remarks value={form.otherRemarks} onChange={(v) => set("otherRemarks", v)} />
+            </SectionCard>
+
+            <PositiveCard title="Participant Capabilities" items={PARTICIPANTS} group="participants" form={form} setMap={setMap} note="Note numbers in remarks" />
+
+            <SectionCard title="Pre-Session Checklist" accent={COLORS.navy}>
+              <div style={{ padding: "8px 12px", background: "#fdecea", borderRadius: 8, marginBottom: 14, fontSize: 13, color: "#c0392b", fontWeight: 600 }}>
+                If the answer to any question is "No", people are at risk and the session should not continue.
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: "0 28px" }}>
+                <div>{CHECKLIST_LEFT.map((l) => <YesNoRow key={l} label={l} value={form.checkLeft[l]} onChange={(v) => setMap("checkLeft", l, v)} />)}</div>
+                <div>{CHECKLIST_RIGHT.map((l) => <YesNoRow key={l} label={l} value={form.checkRight[l]} onChange={(v) => setMap("checkRight", l, v)} />)}</div>
+              </div>
+              <div style={{ marginTop: 16 }}>
+                <Field label="Trainer/Coach Signature" value={form.trainerSig} onChange={(v) => set("trainerSig", v)} placeholder="Type full name to sign" />
+              </div>
+            </SectionCard>
+          </>
+        ) : (
+          <>
+            <SectionCard title="Hazards & Additional Control Measures" accent={COLORS.navy}>
+              <div style={{ display: "grid", gap: 14 }}>
+                {form.hazards.map((h, i) => (
+                  <div key={i} style={{ border: "1px solid #e6eaf1", borderRadius: 10, padding: 14, position: "relative" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                      <span style={{ fontSize: 12, fontWeight: 800, color: COLORS.mid }}>HAZARD {i + 1}</span>
+                      {form.hazards.length > 1 && (
+                        <button onClick={() => rmHazard(i)} style={{ background: "none", border: "none", cursor: "pointer", color: "#c0392b" }}><Trash2 size={16} /></button>
+                      )}
+                    </div>
+                    <div style={{ display: "grid", gap: 10 }}>
+                      <Textarea label="Hazards involved" value={h.hazards} onChange={(v) => setHazard(i, "hazards", v)} />
+                      <Textarea label="Additional control measures" value={h.controls} onChange={(v) => setHazard(i, "controls", v)} />
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+                        <Select label="Likelihood" value={h.likelihood} onChange={(v) => setHazard(i, "likelihood", v)} options={LIKE_SEV} />
+                        <Select label="Severity" value={h.severity} onChange={(v) => setHazard(i, "severity", v)} options={LIKE_SEV} />
+                        <Select label="Rating" value={h.rating} onChange={(v) => setHazard(i, "rating", v)} options={RATING} />
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <button onClick={addHazard} style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 7, background: COLORS.zissou + "22", color: COLORS.navy, border: `1.5px dashed ${COLORS.mid}`, padding: "10px 16px", borderRadius: 9, fontSize: 13.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", width: "100%", justifyContent: "center" }}>
+                <Plus size={17} /> Add hazard
+              </button>
+            </SectionCard>
+
+            <SectionCard title="Additional Comments & Actions" accent={COLORS.navy}>
+              <div style={{ display: "grid", gap: 14 }}>
+                <Textarea label="Additional comments" value={form.addComments} onChange={(v) => set("addComments", v)} rows={4} />
+                <Textarea label="Additional action required" value={form.addAction} onChange={(v) => set("addAction", v)} rows={4} />
+              </div>
+            </SectionCard>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---- More UI pieces --------------------------------------------------------
+
+const GYLLY_LOGO = "data:image/png;base64,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";
+
+function Header() {
+  return (
+    <div style={{ background: `linear-gradient(135deg, ${COLORS.navy} 0%, ${COLORS.sapphire} 75%, ${COLORS.mid} 130%)`, color: "#fff" }}>
+      <div style={{ maxWidth: 980, margin: "0 auto", padding: "18px 20px", display: "flex", alignItems: "center", gap: 13 }}>
+        <div style={{ background: "#fff", borderRadius: 11, padding: "7px 11px", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 1px 4px rgba(8,20,92,.18)" }}>
+          <img src={GYLLY_LOGO} alt="Gyllyngvase SLSC" style={{ height: 34, width: "auto", display: "block" }} />
+        </div>
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: ".01em" }}>SLSGB Analytical Risk Assessment</div>
+          <div style={{ fontSize: 12.5, color: "rgba(255,255,255,.7)" }}>Gyllyngvase SLSC · Falmouth · session safety records</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BeachProfile({ tideInfo }) {
+  const W = 400, H = 200;
+  const padL = 38, padR = 14, padT = 14, padB = 28;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+
+  const hasTides = tideInfo && !tideInfo.error && tideInfo.highHeight && tideInfo.lowHeight;
+  const highM = hasTides ? parseFloat(tideInfo.highHeight) : null;
+  const lowM = hasTides ? parseFloat(tideInfo.lowHeight) : null;
+
+  // Vertical scale: 0 m CD at bottom of intertidal, headroom above HW.
+  const maxM = hasTides ? Math.max(highM, 5) * 1.15 : 6;
+  const yFor = (m) => padT + plotH - (m / maxM) * plotH;
+
+  // Representative shelving profile: land high at left, steep upper beach, gentler then seabed.
+  // x positions are fractions across the plot; y are heights in metres (CD).
+  const profilePts = [
+    [0.00, maxM * 0.95],   // back of beach / promenade base
+    [0.12, maxM * 0.78],
+    [0.30, highM != null ? highM + 0.6 : maxM * 0.62], // upper dry beach
+    [0.50, highM != null ? (highM + lowM) / 2 : maxM * 0.42], // mid (steep — deeply shelving)
+    [0.72, lowM != null ? lowM - 0.3 : maxM * 0.20],
+    [1.00, 0.0],            // seabed offshore
+  ];
+  const xFor = (f) => padL + f * plotW;
+  const profilePath = profilePts.map((p, i) => `${i ? "L" : "M"} ${xFor(p[0]).toFixed(1)} ${yFor(p[1]).toFixed(1)}`).join(" ");
+  const landFill = `${profilePath} L ${xFor(1).toFixed(1)} ${yFor(0).toFixed(1)} L ${padL} ${yFor(0)} Z`;
+
+  const hwY = highM != null ? yFor(highM) : null;
+  const lwY = lowM != null ? yFor(lowM) : null;
+
+  return (
+    <div style={{ flex: "1 1 300px", minWidth: 280, background: "#fff", border: "1px solid #e6eaf1", borderRadius: 10, padding: "10px 12px" }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.navy, marginBottom: 4 }}>Beach profile (cross-section)</div>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ maxWidth: 380, display: "block", margin: "0 auto" }} xmlns="http://www.w3.org/2000/svg">
+        {/* sea body up to high water (or mid if no tides) */}
+        {hwY != null && (
+          <rect x={padL} y={hwY} width={plotW} height={yFor(0) - hwY} fill={`${COLORS.zissou}33`} />
+        )}
+        {/* intertidal zone shading between HW and LW */}
+        {hwY != null && lwY != null && (
+          <rect x={padL} y={hwY} width={plotW} height={lwY - hwY} fill={`${COLORS.yellow}33`} />
+        )}
+        {/* land / beach fill */}
+        <path d={landFill} fill="#efe4c2" stroke="none" />
+        <path d={profilePath} fill="none" stroke="#c9a227" strokeWidth="2" />
+
+        {/* vertical axis ticks every 1 m */}
+        {Array.from({ length: Math.ceil(maxM) + 1 }, (_, i) => i).map((m) => (
+          <g key={m}>
+            <line x1={padL - 3} y1={yFor(m)} x2={padL} y2={yFor(m)} stroke="#9aa5b1" strokeWidth="1" />
+            <text x={padL - 6} y={yFor(m) + 3} fontSize="8.5" fill="#6b7684" textAnchor="end">{m}</text>
+          </g>
+        ))}
+        <text x={11} y={padT + plotH / 2} fontSize="9" fill="#6b7684" textAnchor="middle" transform={`rotate(-90 11 ${padT + plotH / 2})`}>Height (m CD)</text>
+
+        {/* high water line */}
+        {hwY != null && (
+          <g>
+            <line x1={padL} y1={hwY} x2={W - padR} y2={hwY} stroke={COLORS.navy} strokeWidth="1.5" strokeDasharray="5 3" />
+            <text x={W - padR} y={hwY - 4} fontSize="9.5" fontWeight="700" fill={COLORS.navy} textAnchor="end">HW {highM.toFixed(2)} m</text>
+          </g>
+        )}
+        {/* low water line */}
+        {lwY != null && (
+          <g>
+            <line x1={padL} y1={lwY} x2={W - padR} y2={lwY} stroke={COLORS.mid} strokeWidth="1.5" strokeDasharray="5 3" />
+            <text x={W - padR} y={lwY + 12} fontSize="9.5" fontWeight="700" fill={COLORS.mid} textAnchor="end">LW {lowM.toFixed(2)} m</text>
+          </g>
+        )}
+
+        {/* labels */}
+        <text x={padL + 4} y={padT + 12} fontSize="9.5" fill="#8a7a3a" fontWeight="700">Promenade</text>
+        <text x={W - padR - 4} y={padT + 12} fontSize="9.5" fill={COLORS.mid} fontWeight="700" textAnchor="end">Sea →</text>
+        {hwY != null && lwY != null && (
+          <text x={padL + plotW * 0.5} y={(hwY + lwY) / 2} fontSize="9" fill="#b9770e" fontWeight="600" textAnchor="middle">Intertidal</text>
+        )}
+      </svg>
+      {hasTides ? (
+        <div style={{ fontSize: 10.5, color: "#6b7684", textAlign: "center", marginTop: 2 }}>
+          Tidal range ~{(highM - lowM).toFixed(1)} m today. Slope is representative (Gylly shelves steeply); waterlines are live to Chart Datum.
+        </div>
+      ) : (
+        <div style={{ fontSize: 10.5, color: "#b9770e", textAlign: "center", marginTop: 2 }}>
+          Generic profile — fetch tides (WorldTides key) to mark live high/low waterlines.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BeachSchematic({ wx }) {
+  const W = 400, H = 360, cx = 200, cy = 188;
+  // Beach faces ~160° (SSE); shoreline runs roughly NE–SW. Land NNW, open sea SSE.
+  const BEACH_FACING = 160;
+  const compassR = 150;
+  const toXY = (bearing, r) => {
+    const a = (bearing - 90) * Math.PI / 180;
+    return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+  };
+  const arrow = (dirFrom, color, label) => {
+    if (dirFrom == null) return null;
+    const travel = (dirFrom + 180) % 360;
+    const [tx, ty] = toXY(dirFrom, compassR - 8);
+    const [hx, hy] = toXY(travel, compassR - 58);
+    const ang = Math.atan2(hy - ty, hx - tx), ah = 9;
+    const left = [hx - ah * Math.cos(ang - 0.5), hy - ah * Math.sin(ang - 0.5)];
+    const right = [hx - ah * Math.cos(ang + 0.5), hy - ah * Math.sin(ang + 0.5)];
+    const diff = Math.abs(((travel - (BEACH_FACING + 180)) % 360 + 540) % 360 - 180);
+    const onshore = diff < 60 ? "Onshore" : diff > 120 ? "Offshore" : "Cross-shore";
+    const [lx, ly] = toXY(dirFrom, compassR + 16);
+    return (
+      <g key={label}>
+        <line x1={tx} y1={ty} x2={hx} y2={hy} stroke={color} strokeWidth="4" strokeLinecap="round" />
+        <polygon points={`${hx},${hy} ${left[0]},${left[1]} ${right[0]},${right[1]}`} fill={color} />
+        <text x={lx} y={ly} fontSize="11" fontWeight="700" fill={color} textAnchor="middle" dominantBaseline="middle">{label} {Math.round(dirFrom)}° {DEG_TO_COMPASS(dirFrom)}</text>
+        <text x={lx} y={ly + 13} fontSize="9.5" fill="#6b7684" textAnchor="middle" dominantBaseline="middle">{onshore}</text>
+      </g>
+    );
+  };
+
+  // Traced Gyllyngvase plan: coordinates in an un-rotated frame (beach roughly horizontal,
+  // promenade at top, sea below), then rotated so the beach faces 160° true (SSE) on the compass.
+  // Rotation: shoreline normal should point to BEACH_FACING. In the local frame the sea is "down"
+  // (normal points to 180°), so rotate by (BEACH_FACING - 180) = -20°.
+  const rot = ((BEACH_FACING - 180) * Math.PI) / 180;
+  const cosR = Math.cos(rot), sinR = Math.sin(rot);
+  const place = (x, y) => {
+    const dx = x - cx, dy = y - cy;
+    return [cx + dx * cosR - dy * sinR, cy + dx * sinR + dy * cosR];
+  };
+  const P = (pts) => pts.map(([x, y]) => place(x, y));
+  const toPath = (pts, close) => pts.map((p, i) => `${i ? "L" : "M"} ${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(" ") + (close ? " Z" : "");
+
+  // Local-frame control points (cx=200,cy=188). Crescent: concave toward the sea (downward).
+  // Land block (promenade/gardens) fills above the sand line.
+  const sandTop = [[70, 150], [110, 140], [150, 134], [200, 132], [250, 134], [290, 140], [330, 150]]; // back of beach
+  const waterline = [[78, 178], [120, 168], [160, 162], [200, 160], [240, 162], [280, 168], [322, 178]]; // mean shoreline (crescent)
+  const landPoly = P([[60, 60], [340, 60], ...sandTop.slice().reverse().map(p=>p)]); // top land area down to back of beach
+  const sandPoly = P([...sandTop, ...waterline.slice().reverse()]);
+  const seaPoly = P([[60, 300], [340, 300], ...waterline.slice().reverse()]);
+  const headlandW = P([[60, 60], [60, 200], [92, 188], [86, 150], [78, 110], [72, 60]]);
+  const headlandE = P([[340, 60], [340, 200], [308, 188], [314, 150], [322, 110], [328, 60]]);
+
+  const lblSand = place(200, 150);
+  const lblSea = place(200, 250);
+  const lblProm = place(200, 92);
+  const lblWE = place(95, 120), lblEE = place(305, 120);
+
+  return (
+    <div style={{ flex: "1 1 300px", minWidth: 280, background: "#fff", border: "1px solid #e6eaf1", borderRadius: 10, padding: "10px 12px" }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.navy, marginBottom: 4 }}>Plan view — wind & swell</div>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: "block", margin: "0 auto" }} xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <clipPath id="frameClip"><circle cx={cx} cy={cy} r={compassR - 2} /></clipPath>
+        </defs>
+        <g clipPath="url(#frameClip)">
+          <rect x="0" y="0" width={W} height={H} fill={`${COLORS.zissou}26`} />
+          <path d={toPath(landPoly, true)} fill="#eef0f3" />
+          <path d={toPath(headlandW, true)} fill="#d9dde4" />
+          <path d={toPath(headlandE, true)} fill="#d9dde4" />
+          <path d={toPath(seaPoly, true)} fill={`${COLORS.zissou}40`} />
+          <path d={toPath(sandPoly, true)} fill="#f1e4be" stroke="#d8c277" strokeWidth="1" />
+          <path d={toPath(P(waterline), false)} fill="none" stroke={COLORS.mid} strokeWidth="1.5" />
+        </g>
+        <circle cx={cx} cy={cy} r={compassR - 2} fill="none" stroke="#dde3ec" strokeWidth="1" />
+
+        <text x={lblProm[0]} y={lblProm[1]} fontSize="10" fill="#8a7a3a" fontWeight="700" textAnchor="middle">Promenade / gardens</text>
+        <text x={lblSand[0]} y={lblSand[1]} fontSize="10" fill="#b9770e" fontWeight="700" textAnchor="middle">Gyllyngvase sand</text>
+        <text x={lblSea[0]} y={lblSea[1]} fontSize="9.5" fill={COLORS.mid} fontWeight="600" textAnchor="middle">Falmouth Bay</text>
+        <text x={lblWE[0]} y={lblWE[1]} fontSize="8" fill="#6b7684" textAnchor="middle">rocks</text>
+        <text x={lblEE[0]} y={lblEE[1]} fontSize="8" fill="#6b7684" textAnchor="middle">rocks</text>
+
+        <g>
+          <circle cx={cx} cy={cy} r="3" fill={COLORS.navy} />
+          {[["N", 0], ["E", 90], ["S", 180], ["W", 270]].map(([l, d]) => {
+            const [x, y] = toXY(d, compassR + 30);
+            return <text key={l} x={x} y={y} fontSize="11" fontWeight="700" fill="#1f2733" textAnchor="middle" dominantBaseline="middle">{l}</text>;
+          })}
+          <line x1={cx} y1={cy - compassR - 18} x2={cx} y2={cy - compassR - 10} stroke="#1f2733" strokeWidth="1.5" />
+        </g>
+
+        {arrow(wx?.windDir, COLORS.navy, "Wind")}
+        {arrow(wx?.swellDir ?? wx?.waveDir ?? null, COLORS.zissou, "Swell")}
+      </svg>
+      <div style={{ display: "flex", gap: 14, justifyContent: "center", marginTop: 4, fontSize: 10.5, color: "#6b7684", flexWrap: "wrap" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 14, height: 3, background: COLORS.navy, display: "inline-block", borderRadius: 2 }} /> Wind</span>
+        <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 14, height: 3, background: COLORS.zissou, display: "inline-block", borderRadius: 2 }} /> Swell</span>
+        <span>arrows show travel direction</span>
+      </div>
+      {wx?.swellDir == null && wx?.waveDir == null && <div style={{ fontSize: 10.5, color: "#b9770e", textAlign: "center", marginTop: 3 }}>Swell direction unavailable from feed</div>}
+    </div>
+  );
+}
+
+function SwimCam() {
+  const [open, setOpen] = React.useState(false);
+  const [failed, setFailed] = React.useState(false);
+  const EMBED = "https://camsecure.co/httpswebcam/gyllybeach/gyllybeach.html";
+  const PAGE = "https://www.gyllybeach.com/swimcam";
+  return (
+    <div style={{ marginTop: 12, background: "#fff", border: "1px solid #e6eaf1", borderRadius: 10, padding: "10px 12px" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.navy }}>Live SwimCam · Gylly Beach</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          {!open && (
+            <button onClick={() => { setOpen(true); setFailed(false); }}
+              style={{ background: COLORS.mid, color: "#fff", border: "none", padding: "6px 12px", borderRadius: 7, fontSize: 12.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
+              Show camera
+            </button>
+          )}
+          <a href={PAGE} target="_blank" rel="noopener noreferrer"
+            style={{ background: "#fff", color: COLORS.navy, border: "1.5px solid #dde3ec", padding: "5px 11px", borderRadius: 7, fontSize: 12.5, fontWeight: 700, cursor: "pointer", textDecoration: "none" }}>
+            Open in new tab ↗
+          </a>
+        </div>
+      </div>
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          {!failed ? (
+            <div style={{ position: "relative", width: "100%", paddingTop: "56.25%", borderRadius: 8, overflow: "hidden", border: "1px solid #e6eaf1", background: "#000" }}>
+              <iframe title="Gylly Beach SwimCam" src={EMBED}
+                onError={() => setFailed(true)}
+                allow="fullscreen" allowFullScreen
+                style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", border: "none" }} />
+            </div>
+          ) : null}
+          <div style={{ marginTop: 6, fontSize: 10.5, color: "#6b7684" }}>
+            If the camera doesn’t load above, the provider blocks embedding — use “Open in new tab”. Feed courtesy of Gylly Beach Cafe.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SwimCamFallbackNote() { return null; }
+
+function LivePanel({ wx, loading, error, onFetch, tideInfo, tideKey, onTideKey }) {
+  const [showKey, setShowKey] = React.useState(false);
+  const tile = (icon, label, val) => (
+    <div style={{ background: "#fff", borderRadius: 8, padding: "8px 11px", border: "1px solid #e6eaf1", minWidth: 92 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 5, color: "#6b7684", fontSize: 11, fontWeight: 600 }}>{icon}{label}</div>
+      <div style={{ fontSize: 15, fontWeight: 700, color: COLORS.navy, marginTop: 2 }}>{val}</div>
+    </div>
+  );
+  return (
+    <div style={{ background: `linear-gradient(135deg, ${COLORS.zissou}1f, ${COLORS.mid}14)`, border: `1px solid ${COLORS.zissou}55`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <CloudSun size={18} color={COLORS.mid} />
+          <span style={{ fontSize: 13.5, fontWeight: 700, color: COLORS.navy }}>Live conditions · Gyllyngvase Beach, Falmouth</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => setShowKey((s) => !s)} title="Tide data settings"
+            style={{ background: "none", border: "none", color: COLORS.mid, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", textDecoration: "underline" }}>
+            Tide key{tideKey ? " ✓" : ""}
+          </button>
+          <button onClick={onFetch} disabled={loading}
+            style={{ display: "flex", alignItems: "center", gap: 6, background: COLORS.mid, color: "#fff", border: "none", padding: "7px 14px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: loading ? "wait" : "pointer", fontFamily: "inherit", opacity: loading ? 0.7 : 1 }}>
+            <RefreshCw size={14} style={{ animation: loading ? "spin 1s linear infinite" : "none" }} />
+            {loading ? "Fetching…" : wx ? "Refresh" : "Fetch live data"}
+          </button>
+        </div>
+      </div>
+
+      {showKey && (
+        <div style={{ marginTop: 12, padding: 11, background: "#fff", borderRadius: 8, border: "1px solid #e6eaf1" }}>
+          <div style={{ fontSize: 12, color: "#6b7684", marginBottom: 6 }}>
+            Tide times come from WorldTides. Paste a free API key (worldtides.info → register) to auto-fill next high/low tide. Stored only in this browser. Leave blank to enter tides manually.
+          </div>
+          <input type="text" value={tideKey} placeholder="WorldTides API key"
+            onChange={(e) => onTideKey(e.target.value.trim())}
+            style={{ width: "100%", padding: "8px 10px", border: "1.5px solid #dde3ec", borderRadius: 7, fontSize: 13, boxSizing: "border-box", fontFamily: "inherit" }} />
+        </div>
+      )}
+
+      {error && <div style={{ marginTop: 10, fontSize: 12.5, color: "#c0392b", fontWeight: 600 }}>{error}</div>}
+      {wx && !error && (
+        <>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
+            {tile(<Waves size={13} />, "Swell", `${wx.swellHeight ?? "–"} m`)}
+            {tile(<Waves size={13} />, "Wave", `${wx.waveHeight ?? "–"} m / ${wx.wavePeriod ?? "–"}s`)}
+            {tile(<Wind size={13} />, "Wind", `${wx.windSpeed != null ? Math.round(wx.windSpeed) : "–"} km/h ${wx.windDir != null ? DEG_TO_COMPASS(wx.windDir) : ""}`)}
+            {tile(<Wind size={13} />, "Gust", `${wx.windGust != null ? Math.round(wx.windGust) : "–"} km/h`)}
+            {tile(<Droplets size={13} />, "Air", `${wx.temp != null ? Math.round(wx.temp) : "–"}°C`)}
+            {tile(<CloudSun size={13} />, "Sky", WX_DESC[wx.weatherCode] ?? "–")}
+          </div>
+          {tideInfo && !tideInfo.error && (tideInfo.highTime || tideInfo.lowTime) && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
+              {tile(<Waves size={13} color={COLORS.mid} />, "Next high", `${tideInfo.highTime || "–"} · ${tideInfo.highHeight || "–"}m`)}
+              {tile(<Waves size={13} color={COLORS.mid} />, "Next low", `${tideInfo.lowTime || "–"} · ${tideInfo.lowHeight || "–"}m`)}
+            </div>
+          )}
+          {tideInfo && tideInfo.error && (
+            <div style={{ marginTop: 8, fontSize: 11.5, color: "#b9770e" }}>Tides unavailable ({tideInfo.error}). Check your WorldTides key or enter tides manually.</div>
+          )}
+          {!tideKey && (
+            <div style={{ marginTop: 8, fontSize: 11.5, color: "#6b7684" }}>Tide times not fetched — add a WorldTides key via “Tide key” above, or fill the tide fields manually.</div>
+          )}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 12 }}>
+            <BeachSchematic wx={wx} />
+            <BeachProfile tideInfo={tideInfo} />
+          </div>
+          <div style={{ marginTop: 9, fontSize: 11, color: "#6b7684" }}>
+            Auto-filled into Water State, Other Risks & tide fields. Bands are conservative guidance — confirm against your own judgement before signing. Sources: Open-Meteo (weather/waves), WorldTides (tides). Tide heights are to Chart Datum.
+          </div>
+        </>
+      )}
+      <SwimCam />
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
+}
+
+function Remarks({ value, onChange }) {
+  return (
+    <div style={{ marginTop: 12 }}>
+      <Textarea label="Remarks" value={value} onChange={onChange} />
+    </div>
+  );
+}
+
+function PositiveCard({ title, items, group, form, setMap, note }) {
+  return (
+    <SectionCard title={title} accent={COLORS.green}>
+      {note && <p style={{ margin: "0 0 10px", fontSize: 12.5, color: "#6b7684" }}>{note}</p>}
+      {items.map((l) => <YesNoRow key={l} label={l} na={false} value={form[group][l]} onChange={(v) => setMap(group, l, v)} />)}
+    </SectionCard>
+  );
+}
+
+function Textarea({ label, value, onChange, rows = 2 }) {
+  return (
+    <label style={{ display: "block" }}>
+      <span style={{ display: "block", fontSize: 11.5, fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase", color: COLORS.navy, marginBottom: 5 }}>{label}</span>
+      <textarea value={value} rows={rows} onChange={(e) => onChange(e.target.value)} style={{ ...inputStyle, resize: "vertical", lineHeight: 1.45 }} />
+    </label>
+  );
+}
+
+function Select({ label, value, onChange, options }) {
+  return (
+    <label style={{ display: "block" }}>
+      <span style={{ display: "block", fontSize: 11.5, fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase", color: COLORS.navy, marginBottom: 5 }}>{label}</span>
+      <select value={value} onChange={(e) => onChange(e.target.value)} style={{ ...inputStyle, cursor: "pointer" }}>
+        <option value="">—</option>
+        {options.map((o) => <option key={o} value={o}>{o}</option>)}
+      </select>
+    </label>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
