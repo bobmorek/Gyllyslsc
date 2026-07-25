@@ -197,6 +197,78 @@ async function fetchLiveConditions() {
   };
 }
 
+// Worst-case forecast across the session window (range = {start,end} epoch-ms on
+// dateStr). Uses Open-Meteo hourly forecast (free, no key, ~16 days ahead) and
+// returns the same shape as fetchLiveConditions, populated with the MOST SEVERE
+// wind / swell / gust / weather and the LOWEST visibility & temperature over the
+// hours the session spans. Directions are taken at the peak-wind / peak-swell
+// hour. Returns null if the window isn't within the forecast range so the caller
+// can fall back to live "now".
+async function fetchForecastWindow(range, dateStr) {
+  const { lat, lon } = GYLLYNGVASE;
+  const startMs = range.start;
+  const end = range.end && range.end > range.start ? range.end : range.start;
+  const hMarine = "wave_height,wave_direction,wave_period,swell_wave_height,swell_wave_period,swell_wave_direction";
+  const hWx = "temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,weather_code,visibility";
+  const marineUrl = `https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&hourly=${hMarine}&timezone=Europe%2FLondon&start_date=${dateStr}&end_date=${dateStr}`;
+  const wxUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=${hWx}&wind_speed_unit=kmh&timezone=Europe%2FLondon&start_date=${dateStr}&end_date=${dateStr}`;
+
+  const [mRes, wRes] = await Promise.allSettled([getJSON(marineUrl), getJSON(wxUrl)]);
+  if (mRes.status === "rejected" && wRes.status === "rejected") {
+    throw new Error(`weather: ${wRes.reason?.message || wRes.reason}; marine: ${mRes.reason?.message || mRes.reason}`);
+  }
+  const m = mRes.status === "fulfilled" ? mRes.value : null;
+  const w = wRes.status === "fulfilled" ? wRes.value : null;
+
+  // Hourly slots that overlap the session: slot at time h covers [h, h+1h).
+  const overlap = (timeArr) => {
+    const idx = [];
+    (timeArr || []).forEach((t, i) => {
+      const hs = new Date(t).getTime();
+      // Include the end-boundary hour too (conditions AT the finish time matter).
+      if (hs <= end && hs + 3600000 > startMs) idx.push(i);
+    });
+    return idx;
+  };
+  const wIdx = overlap(w?.hourly?.time);
+  const mIdx = overlap(m?.hourly?.time);
+  if (!wIdx.length && !mIdx.length) return null; // outside forecast range → fall back
+
+  const pickMax = (arr, idx) => { let best = null, at = null; idx.forEach((i) => { const v = arr?.[i]; if (v != null && (best == null || v > best)) { best = v; at = i; } }); return { v: best, at }; };
+  const pickMin = (arr, idx) => { let best = null; idx.forEach((i) => { const v = arr?.[i]; if (v != null && (best == null || v < best)) best = v; }); return best; };
+  const at = (arr, i) => (i == null ? undefined : arr?.[i]);
+  const clock = (t) => (t ? new Date(t).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "");
+  const fmtMs = (ms) => new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+
+  const mh = m?.hourly, wh = w?.hourly;
+  const wind = pickMax(wh?.wind_speed_10m, wIdx);
+  const swell = pickMax(mh?.swell_wave_height, mIdx);
+  const wave = pickMax(mh?.wave_height, mIdx);
+  const gust = pickMax(wh?.wind_gusts_10m, wIdx);
+  const code = pickMax(wh?.weather_code, wIdx);
+
+  return {
+    session: true,
+    windowLabel: `${fmtMs(startMs)}–${fmtMs(end)}`,
+    windAt: clock(at(wh?.time, wind.at)),
+    swellAt: clock(at(mh?.time, swell.at)),
+    marineOk: !!m, weatherOk: !!w,
+    waveHeight: wave.v != null ? Number(wave.v.toFixed(2)) : wave.v,
+    wavePeriod: at(mh?.wave_period, wave.at),
+    swellHeight: swell.v != null ? Number(swell.v.toFixed(2)) : swell.v,
+    swellPeriod: at(mh?.swell_wave_period, swell.at),
+    waveDir: at(mh?.wave_direction, wave.at),
+    swellDir: at(mh?.swell_wave_direction, swell.at),
+    temp: pickMin(wh?.temperature_2m, wIdx),              // coldest in window
+    windSpeed: wind.v,
+    windGust: gust.v,
+    windDir: at(wh?.wind_direction_10m, wind.at),          // direction at peak wind
+    weatherCode: code.v,
+    visibility: pickMin(wh?.visibility, wIdx),             // worst (lowest) visibility
+    time: at(wh?.time, wIdx[0]) || at(mh?.time, mIdx[0]) || null,
+  };
+}
+
 const WX_DESC = {
   0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
   45: "Fog", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
@@ -420,17 +492,28 @@ function App() {
   const getLive = async () => {
     setWxLoading(true); setWxError(null);
     try {
+      // If a session date/time is set, pull the forecast for that window and use
+      // the worst case across it; otherwise use live "now". Fall back to now if the
+      // session is outside the forecast range or the forecast call fails.
+      const range = parseSessionRange(form.sessionTime, form.date);
+      const conditionsP = (async () => {
+        if (range) {
+          try { const fc = await fetchForecastWindow(range, form.date); if (fc) return fc; } catch (e) { /* fall back to now */ }
+        }
+        return fetchLiveConditions();
+      })();
       const [d, tides] = await Promise.all([
-        fetchLiveConditions(),
+        conditionsP,
         fetchTides(tideKey).catch((e) => ({ tideError: e.message || String(e) })),
       ]);
       setWx(d);
       if (tides && !tides.tideError) setTideInfo(tides); else if (tides?.tideError) setTideInfo({ error: tides.tideError });
       const remarkBits = [];
-      if (d.swellHeight != null) remarkBits.push(`Swell ${d.swellHeight}m @ ${d.swellPeriod ?? "?"}s`);
+      if (d.swellHeight != null) remarkBits.push(`Swell ${d.swellHeight}m @ ${d.swellPeriod ?? "?"}s${d.session && d.swellAt ? ` (peak ${d.swellAt})` : ""}`);
       if (d.waveHeight != null) remarkBits.push(`Wave ${d.waveHeight}m`);
-      if (d.windSpeed != null) remarkBits.push(`Wind ${Math.round(d.windSpeed)}km/h ${d.windDir != null ? DEG_TO_COMPASS(d.windDir) : ""} (gust ${Math.round(d.windGust ?? 0)})`);
+      if (d.windSpeed != null) remarkBits.push(`Wind ${Math.round(d.windSpeed)}km/h ${d.windDir != null ? DEG_TO_COMPASS(d.windDir) : ""} (gust ${Math.round(d.windGust ?? 0)})${d.session && d.windAt ? ` (peak ${d.windAt})` : ""}`);
       const stamp = d.time ? new Date(d.time).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "short" }) : "";
+      const src = d.session ? `Open-Meteo forecast — worst over session ${d.windowLabel}` : (stamp ? `Open-Meteo (live) @ ${stamp}` : "Open-Meteo");
       const t = tides && !tides.tideError ? tides : null;
       setForm((f) => ({
         ...f,
@@ -443,13 +526,13 @@ function App() {
           "Swell Size": swellBand(d.swellHeight ?? d.waveHeight) || f.water["Swell Size"],
           "Wind direction & strength": windBand(d.windSpeed) || f.water["Wind direction & strength"],
         },
-        waterRemarks: `${remarkBits.join("  ·  ")}${stamp ? `  ·  Open-Meteo @ ${stamp}` : ""}${f.waterRemarks ? `\n${f.waterRemarks}` : ""}`,
+        waterRemarks: `${remarkBits.join("  ·  ")}  ·  ${src}${f.waterRemarks ? `\n${f.waterRemarks}` : ""}`,
         other: {
           ...f.other,
           "Weather": d.weatherCode >= 80 ? "Change" : d.weatherCode >= 45 ? "Caution" : f.other["Weather"],
           "Visibility/Available light": d.visibility != null && d.visibility < 2000 ? "Caution" : f.other["Visibility/Available light"],
         },
-        otherRemarks: `${WX_DESC[d.weatherCode] ?? "Conditions"}, ${d.temp != null ? Math.round(d.temp) + "°C" : ""}${d.visibility != null ? `, visibility ~${(d.visibility / 1000).toFixed(1)}km` : ""}${f.otherRemarks ? `\n${f.otherRemarks}` : ""}`,
+        otherRemarks: `${WX_DESC[d.weatherCode] ?? "Conditions"}, ${d.temp != null ? Math.round(d.temp) + "°C" : ""}${d.visibility != null ? `, visibility ~${(d.visibility / 1000).toFixed(1)}km` : ""}${d.session ? " — worst over session" : ""}${f.otherRemarks ? `\n${f.otherRemarks}` : ""}`,
       }));
     } catch (e) {
       setWxError(`Couldn't reach the weather service (${e.message || e}). Check your internet connection and try again, or enter conditions manually.`);
@@ -959,6 +1042,7 @@ function SwimCamFallbackNote() { return null; }
 
 function LivePanel({ wx, loading, error, onFetch, tideInfo, tideKey, onTideKey, sessionTime, date }) {
   const [showKey, setShowKey] = React.useState(false);
+  const hasSession = !!parseSessionRange(sessionTime, date);
   const tile = (icon, label, val) => (
     <div style={{ background: "#fff", borderRadius: 8, padding: "8px 11px", border: "1px solid #e6eaf1", minWidth: 92 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 5, color: "#6b7684", fontSize: 11, fontWeight: 600 }}>{icon}{label}</div>
@@ -970,7 +1054,10 @@ function LivePanel({ wx, loading, error, onFetch, tideInfo, tideKey, onTideKey, 
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <CloudSun size={18} color={COLORS.mid} />
-          <span style={{ fontSize: 13.5, fontWeight: 700, color: COLORS.navy }}>Live conditions · Gyllyngvase Beach, Falmouth</span>
+          <div>
+            <span style={{ fontSize: 13.5, fontWeight: 700, color: COLORS.navy }}>{hasSession ? "Session forecast" : "Live conditions"} · Gyllyngvase Beach, Falmouth</span>
+            <div style={{ fontSize: 11, color: "#6b7684" }}>{hasSession ? `Worst case forecast across your session (${sessionTime})` : "Current conditions — set a session time to forecast the window"}</div>
+          </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <button onClick={() => setShowKey((s) => !s)} title="Tide data settings"
@@ -980,7 +1067,7 @@ function LivePanel({ wx, loading, error, onFetch, tideInfo, tideKey, onTideKey, 
           <button onClick={onFetch} disabled={loading}
             style={{ display: "flex", alignItems: "center", gap: 6, background: COLORS.mid, color: "#fff", border: "none", padding: "7px 14px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: loading ? "wait" : "pointer", fontFamily: "inherit", opacity: loading ? 0.7 : 1 }}>
             <RefreshCw size={14} style={{ animation: loading ? "spin 1s linear infinite" : "none" }} />
-            {loading ? "Fetching…" : wx ? "Refresh" : "Fetch live data"}
+            {loading ? "Fetching…" : wx ? "Refresh" : (hasSession ? "Fetch session forecast" : "Fetch live data")}
           </button>
         </div>
       </div>
@@ -999,6 +1086,11 @@ function LivePanel({ wx, loading, error, onFetch, tideInfo, tideKey, onTideKey, 
       {error && <div style={{ marginTop: 10, fontSize: 12.5, color: "#c0392b", fontWeight: 600 }}>{error}</div>}
       {wx && !error && (
         <>
+          {wx.session && (
+            <div style={{ marginTop: 10, display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11.5, fontWeight: 700, color: "#7a5a00", background: `${COLORS.yellow}33`, border: `1px solid ${COLORS.yellow}`, borderRadius: 20, padding: "3px 11px" }}>
+              <AlertTriangle size={13} /> Worst case forecast over session {wx.windowLabel}
+            </div>
+          )}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
             {tile(<Waves size={13} />, "Swell", `${wx.swellHeight ?? "–"} m`)}
             {tile(<Waves size={13} />, "Wave", `${wx.waveHeight ?? "–"} m / ${wx.wavePeriod ?? "–"}s`)}
