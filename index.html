@@ -442,10 +442,34 @@ function PrintTitle({ label, form }) {
   );
 }
 
+// Big clickable card used on the landing page to open a tool.
+function ToolCard({ onClick, Icon, name, tagline, desc, accent }) {
+  return (
+    <button onClick={onClick}
+      style={{ textAlign: "left", cursor: "pointer", fontFamily: "inherit", background: "#fff", border: "1px solid #e6eaf1", borderRadius: 16, padding: 0, overflow: "hidden", boxShadow: "0 1px 3px rgba(8,20,92,.05)", display: "flex", flexDirection: "column" }}>
+      <div style={{ background: accent, padding: "18px 20px", display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ width: 46, height: 46, borderRadius: 12, background: "rgba(255,255,255,.18)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <Icon size={26} color="#fff" />
+        </div>
+        <div>
+          <div style={{ fontSize: 22, fontWeight: 800, color: "#fff", lineHeight: 1 }}>{name}</div>
+          <div style={{ fontSize: 12.5, color: "rgba(255,255,255,.85)", marginTop: 4 }}>{tagline}</div>
+        </div>
+      </div>
+      <div style={{ padding: "16px 20px", flex: 1, display: "flex", flexDirection: "column" }}>
+        <p style={{ margin: 0, fontSize: 13.5, color: "#4a5563", lineHeight: 1.5, flex: 1 }}>{desc}</p>
+        <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 6, fontSize: 13.5, fontWeight: 800, color: accent }}>
+          Open {name} <ArrowLeft size={16} style={{ transform: "rotate(180deg)" }} />
+        </div>
+      </div>
+    </button>
+  );
+}
+
 // ---- App -------------------------------------------------------------------
 
 function App() {
-  const [view, setView] = useState("list"); // list | form
+  const [view, setView] = useState("home"); // home | list | planning | form
   const [index, setIndex] = useState([]);
   const [loading, setLoading] = useState(true);
   const [form, setForm] = useState(blankForm());
@@ -545,6 +569,26 @@ function App() {
   const changeCount = ["water", "beach", "other"].reduce((n, g) => n + Object.values(form[g]).filter((v) => v === "Change").length, 0);
 
   const wrap = { fontFamily: "'Aptos','Segoe UI','Calibri','Helvetica',sans-serif", background: "#f4f6fa", minHeight: "100vh", color: "#1f2733" };
+  const backBtn = { display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", color: COLORS.navy, fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" };
+
+  // ---------- HOME (LANDING) VIEW ----------
+  if (view === "home") {
+    return (
+      <div style={wrap}>
+        <Header />
+        <div style={{ maxWidth: 980, margin: "0 auto", padding: "40px 20px" }}>
+          <h2 style={{ margin: 0, fontSize: 26, fontWeight: 800, color: COLORS.navy }}>Session tools</h2>
+          <p style={{ margin: "6px 0 0", color: "#6b7684", fontSize: 14.5 }}>Gyllyngvase SLSC · pick a tool to get started</p>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 18, marginTop: 26 }}>
+            <ToolCard onClick={() => setView("list")} Icon={FileText} name="Bruce" tagline="Analytical Risk Assessment"
+              desc="Create, store and print SLSGB session safety records — water / beach / other risk tables, equipment & safety cover, the pre-session checklist, and hazards & controls." accent={COLORS.navy} />
+            <ToolCard onClick={() => setView("planning")} Icon={CloudSun} name="Sheila" tagline="Session Planning"
+              desc="Live & forecast conditions for your session window — tides, wind & swell plan view, and the beach profile with session start / end waterlines." accent={COLORS.mid} />
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // ---------- LIST VIEW ----------
   if (view === "list") {
@@ -552,9 +596,12 @@ function App() {
       <div style={wrap}>
         <Header />
         <div style={{ maxWidth: 980, margin: "0 auto", padding: "28px 20px" }}>
+          <button onClick={() => setView("home")} style={{ ...backBtn, marginBottom: 16 }}>
+            <ArrowLeft size={18} /> All tools
+          </button>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 22 }}>
             <div>
-              <h2 style={{ margin: 0, fontSize: 24, fontWeight: 800, color: COLORS.navy }}>Risk Assessments</h2>
+              <h2 style={{ margin: 0, fontSize: 24, fontWeight: 800, color: COLORS.navy }}>Bruce · Risk Assessments</h2>
               <p style={{ margin: "4px 0 0", color: "#6b7684", fontSize: 14 }}>Saved records ({index.length})</p>
             </div>
             <button onClick={newForm} style={{ display: "flex", alignItems: "center", gap: 8, background: COLORS.navy, color: "#fff", border: "none", padding: "12px 18px", borderRadius: 10, fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
@@ -590,6 +637,32 @@ function App() {
               ))}
             </div>
           )}
+        </div>
+      </div>
+    );
+  }
+
+  // ---------- PLANNING VIEW (Sheila) ----------
+  if (view === "planning") {
+    return (
+      <div style={wrap}>
+        <Header />
+        <div className="no-print" style={{ position: "sticky", top: 0, zIndex: 20, background: "#fff", borderBottom: "1px solid #e6eaf1", boxShadow: "0 2px 8px rgba(8,20,92,.05)" }}>
+          <div style={{ maxWidth: 980, margin: "0 auto", padding: "12px 20px", display: "flex", alignItems: "center", gap: 12 }}>
+            <button onClick={() => setView("home")} style={backBtn}>
+              <ArrowLeft size={18} /> All tools
+            </button>
+          </div>
+        </div>
+        <div style={{ maxWidth: 980, margin: "0 auto", padding: "22px 20px 60px", display: "grid", gap: 18 }}>
+          <SectionCard title="Sheila · Session Planning" accent={COLORS.mid}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 14, marginBottom: 8 }}>
+              <Field label="Date" type="date" value={form.date} onChange={(v) => set("date", v)} />
+              <Field label="Session time" value={form.sessionTime} onChange={(v) => set("sessionTime", v)} placeholder="e.g. 09:00–11:00" />
+            </div>
+            <LivePanel wx={wx} loading={wxLoading} error={wxError} onFetch={getLive} tideInfo={tideInfo} tideKey={tideKey} onTideKey={saveTideKey} sessionTime={form.sessionTime} date={form.date} />
+            <p style={{ margin: "2px 0 0", fontSize: 12, color: "#6b7684" }}>Set your date &amp; session time, then fetch — Sheila forecasts the worst case across your session window. The date, time and tides carry over to a Bruce assessment.</p>
+          </SectionCard>
         </div>
       </div>
     );
