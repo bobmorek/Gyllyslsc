@@ -10,8 +10,40 @@
   html, body { margin: 0; padding: 0; }
   body { font-family: 'Aptos','Segoe UI','Calibri','Helvetica',sans-serif; }
   @media print {
+    @page { size: A4 portrait; margin: 10mm; }
+    body { background: #fff !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
     .no-print { display: none !important; }
-    body { background: #fff !important; }
+    .print-only { display: block !important; }
+    /* Full-bleed the form on paper */
+    .form-wrap { max-width: none !important; padding: 0 !important; }
+    /* Print both form pages (screen shows only the active tab) */
+    .form-page { display: grid !important; gap: 7px !important; }
+    .form-page[data-formpage="2"] { break-before: page; page-break-before: always; }
+    /* Page 1 mirrors the official form: adverse-effect sections (Water/Beach/Other)
+       on the left, positive-effect sections (Equipment/Safety/Participants) on the
+       right; Session Details & the checklist span the full width. */
+    .form-page[data-formpage="1"] { grid-template-columns: 1fr 1fr !important; gap: 6px !important; align-items: start; }
+    .form-page[data-formpage="1"] > .print-only { grid-column: 1 / -1; }
+    .sec-wide { grid-column: 1 / -1 !important; }
+    /* Tighten cards into a dense, paper-form layout */
+    .sec-card { box-shadow: none !important; border: 1px solid #b9c2d0 !important; border-radius: 5px !important; break-inside: avoid; page-break-inside: avoid; }
+    .sec-head { padding: 3px 8px !important; }
+    .sec-head h3 { font-size: 10.5px !important; }
+    .sec-body { padding: 5px 8px !important; }
+    .sec-body input, .sec-body textarea, .sec-body select { font-size: 10px !important; padding: 2px 5px !important; }
+    .sec-body textarea { min-height: 0 !important; }
+    /* Dense rating rows */
+    .form-row { padding: 1px 0 !important; gap: 6px !important; }
+    .form-row > span { font-size: 9.5px !important; }
+    .form-row button { font-size: 8px !important; padding: 1.5px 5px !important; border-width: 1px !important; }
+    /* Compact the Session Details field grid & activity chips */
+    .sec-body label > span { font-size: 8.5px !important; margin-bottom: 2px !important; }
+    .form-page label { font-size: 10px !important; }
+    .field-grid { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)) !important; gap: 5px 8px !important; }
+    .chip-row { gap: 4px !important; }
+    .chip-row button { font-size: 8.5px !important; padding: 2px 7px !important; }
+    /* Keep remarks / notes boxes shallow on page 1 (page 2 keeps room for detail) */
+    .form-page[data-formpage="1"] textarea { height: 2.1em !important; }
   }
 </style>
 </head>
@@ -80,7 +112,44 @@ async function fetchTides(apiKey) {
     highTime: fmt(nextHigh), highHeight: nextHigh ? nextHigh.height.toFixed(2) : "",
     lowTime: fmt(nextLow), lowHeight: nextLow ? nextLow.height.toFixed(2) : "",
     station: j.station || "",
+    // Full extremes (past + future in the fetched window) so the beach profile can
+    // interpolate the waterline at arbitrary times (e.g. session start/end).
+    extremes: (j.extremes || []).map((e) => ({ dt: e.dt, height: e.height, type: e.type })),
   };
+}
+
+// Interpolate tide height (m CD) at epoch-ms `t` using the standard cosine curve
+// between the two bracketing extremes. Returns null when `t` isn't bracketed.
+function tideHeightAt(extremes, t) {
+  if (!Array.isArray(extremes) || extremes.length < 2) return null;
+  const ex = extremes.map((e) => ({ t: e.dt * 1000, h: e.height })).sort((a, b) => a.t - b.t);
+  for (let i = 0; i < ex.length - 1; i++) {
+    if (t >= ex[i].t && t <= ex[i + 1].t) {
+      const frac = (t - ex[i].t) / (ex[i + 1].t - ex[i].t);
+      return ex[i].h + (ex[i + 1].h - ex[i].h) * (1 - Math.cos(Math.PI * frac)) / 2;
+    }
+  }
+  return null;
+}
+
+// Parse a free-text session time range ("09:00–11:00", "9:00 - 11am", "9am–11am")
+// into { start, end } epoch-ms on the given date (YYYY-MM-DD). End may be null.
+function parseSessionRange(sessionTime, dateStr) {
+  if (!sessionTime || !dateStr) return null;
+  const re = /(\d{1,2})[:.](\d{2})\s*(am|pm)?|(\d{1,2})\s*(am|pm)/gi;
+  const found = [];
+  let m;
+  while ((m = re.exec(sessionTime)) && found.length < 2) {
+    let h, min = 0, ap;
+    if (m[1] != null) { h = +m[1]; min = +m[2]; ap = m[3]; }
+    else { h = +m[4]; ap = m[5]; }
+    if (ap) { ap = ap.toLowerCase(); if (ap === "pm" && h < 12) h += 12; if (ap === "am" && h === 12) h = 0; }
+    if (h > 23 || min > 59) continue;
+    found.push({ h, min });
+  }
+  if (!found.length) return null;
+  const mk = ({ h, min }) => { const d = new Date(`${dateStr}T00:00:00`); d.setHours(h, min, 0, 0); return d.getTime(); };
+  return { start: mk(found[0]), end: found[1] ? mk(found[1]) : null };
 }
 const DEG_TO_COMPASS = (d) => {
   const dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
@@ -222,7 +291,7 @@ const optColor = (v) =>
 function RiskRow({ label, value, onChange }) {
   const isOther = label.includes("Other");
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: "1px solid #eef1f6" }}>
+    <div className="form-row" style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: "1px solid #eef1f6" }}>
       <span style={{ fontSize: 13.5, color: "#1f2733" }}>{label}</span>
       <div style={{ display: "flex", gap: 5 }}>
         {RISK_OPTS.map((o) => {
@@ -246,7 +315,7 @@ function RiskRow({ label, value, onChange }) {
 function YesNoRow({ label, value, onChange, na = true }) {
   const opts = na ? ["Yes", "No", "NA"] : ["Yes", "No"];
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: "1px solid #eef1f6" }}>
+    <div className="form-row" style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: "1px solid #eef1f6" }}>
       <span style={{ fontSize: 13.5, color: "#1f2733" }}>{label}</span>
       <div style={{ display: "flex", gap: 5 }}>
         {opts.map((o) => {
@@ -280,13 +349,23 @@ function Field({ label, value, onChange, type = "text", placeholder }) {
   );
 }
 
-function SectionCard({ title, accent, children }) {
+function SectionCard({ title, accent, children, wide }) {
   return (
-    <div style={{ background: "#fff", borderRadius: 14, border: "1px solid #e6eaf1", overflow: "hidden", boxShadow: "0 1px 3px rgba(8,20,92,.04)" }}>
-      <div style={{ padding: "12px 18px", background: accent || COLORS.navy, display: "flex", alignItems: "center", gap: 9 }}>
+    <div className={"sec-card" + (wide ? " sec-wide" : "")} style={{ background: "#fff", borderRadius: 14, border: "1px solid #e6eaf1", overflow: "hidden", boxShadow: "0 1px 3px rgba(8,20,92,.04)" }}>
+      <div className="sec-head" style={{ padding: "12px 18px", background: accent || COLORS.navy, display: "flex", alignItems: "center", gap: 9 }}>
         <h3 style={{ margin: 0, fontSize: 14.5, fontWeight: 700, color: "#fff", letterSpacing: ".01em" }}>{title}</h3>
       </div>
-      <div style={{ padding: "16px 18px" }}>{children}</div>
+      <div className="sec-body" style={{ padding: "16px 18px" }}>{children}</div>
+    </div>
+  );
+}
+
+// Print-only heading so each printed page is identified once the app chrome is hidden.
+function PrintTitle({ label, form }) {
+  return (
+    <div className="print-only" style={{ display: "none", marginBottom: 2, paddingBottom: 6, borderBottom: `2px solid ${COLORS.navy}` }}>
+      <div style={{ fontSize: 15, fontWeight: 800, color: COLORS.navy }}>SLSGB Analytical Risk Assessment</div>
+      <div style={{ fontSize: 10.5, color: "#555" }}>{label} · Gyllyngvase SLSC · RA No: {form.raNo || "—"} · {form.location || "—"} · {form.date || ""}</div>
     </div>
   );
 }
@@ -437,7 +516,7 @@ function App() {
   return (
     <div style={wrap}>
       <Header />
-      <div style={{ position: "sticky", top: 0, zIndex: 20, background: "#fff", borderBottom: "1px solid #e6eaf1", boxShadow: "0 2px 8px rgba(8,20,92,.05)" }}>
+      <div className="no-print" style={{ position: "sticky", top: 0, zIndex: 20, background: "#fff", borderBottom: "1px solid #e6eaf1", boxShadow: "0 2px 8px rgba(8,20,92,.05)" }}>
         <div style={{ maxWidth: 980, margin: "0 auto", padding: "12px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
           <button onClick={() => setView("list")} style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", color: COLORS.navy, fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
             <ArrowLeft size={18} /> All assessments
@@ -467,12 +546,12 @@ function App() {
         </div>
       </div>
 
-      <div style={{ maxWidth: 980, margin: "0 auto", padding: "22px 20px 60px", display: "grid", gap: 18 }}>
-        {page === 1 ? (
-          <>
-            <SectionCard title="Session Details">
-              <LivePanel wx={wx} loading={wxLoading} error={wxError} onFetch={getLive} tideInfo={tideInfo} tideKey={tideKey} onTideKey={saveTideKey} />
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 14 }}>
+      <div className="form-wrap" style={{ maxWidth: 980, margin: "0 auto", padding: "22px 20px 60px", display: "grid", gap: 18 }}>
+        <div className="form-page" data-formpage="1" style={{ display: page === 1 ? "grid" : "none", gap: 18 }}>
+            <PrintTitle label="Page 1 — Analytical Assessment" form={form} />
+            <SectionCard title="Session Details" wide>
+              <LivePanel wx={wx} loading={wxLoading} error={wxError} onFetch={getLive} tideInfo={tideInfo} tideKey={tideKey} onTideKey={saveTideKey} sessionTime={form.sessionTime} date={form.date} />
+              <div className="field-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 14 }}>
                 <Field label="Risk Assessment No" value={form.raNo} onChange={(v) => set("raNo", v)} />
                 <Field label="Date" type="date" value={form.date} onChange={(v) => set("date", v)} />
                 <Field label="Session time" value={form.sessionTime} onChange={(v) => set("sessionTime", v)} placeholder="e.g. 09:00–11:00" />
@@ -486,7 +565,7 @@ function App() {
               </div>
               <div style={{ marginTop: 16 }}>
                 <span style={{ display: "block", fontSize: 11.5, fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase", color: COLORS.navy, marginBottom: 8 }}>Activity</span>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                <div className="chip-row" style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
                   {ACTIVITIES.map((a) => {
                     const on = form.activities.includes(a);
                     return (
@@ -525,7 +604,7 @@ function App() {
 
             <PositiveCard title="Participant Capabilities" items={PARTICIPANTS} group="participants" form={form} setMap={setMap} note="Note numbers in remarks" />
 
-            <SectionCard title="Pre-Session Checklist" accent={COLORS.navy}>
+            <SectionCard title="Pre-Session Checklist" accent={COLORS.navy} wide>
               <div style={{ padding: "8px 12px", background: "#fdecea", borderRadius: 8, marginBottom: 14, fontSize: 13, color: "#c0392b", fontWeight: 600 }}>
                 If the answer to any question is "No", people are at risk and the session should not continue.
               </div>
@@ -537,9 +616,9 @@ function App() {
                 <Field label="Trainer/Coach Signature" value={form.trainerSig} onChange={(v) => set("trainerSig", v)} placeholder="Type full name to sign" />
               </div>
             </SectionCard>
-          </>
-        ) : (
-          <>
+        </div>
+        <div className="form-page" data-formpage="2" style={{ display: page === 2 ? "grid" : "none", gap: 18 }}>
+            <PrintTitle label="Page 2 — Hazards & Controls" form={form} />
             <SectionCard title="Hazards & Additional Control Measures" accent={COLORS.navy}>
               <div style={{ display: "grid", gap: 14 }}>
                 {form.hazards.map((h, i) => (
@@ -547,7 +626,7 @@ function App() {
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                       <span style={{ fontSize: 12, fontWeight: 800, color: COLORS.mid }}>HAZARD {i + 1}</span>
                       {form.hazards.length > 1 && (
-                        <button onClick={() => rmHazard(i)} style={{ background: "none", border: "none", cursor: "pointer", color: "#c0392b" }}><Trash2 size={16} /></button>
+                        <button className="no-print" onClick={() => rmHazard(i)} style={{ background: "none", border: "none", cursor: "pointer", color: "#c0392b" }}><Trash2 size={16} /></button>
                       )}
                     </div>
                     <div style={{ display: "grid", gap: 10 }}>
@@ -562,7 +641,7 @@ function App() {
                   </div>
                 ))}
               </div>
-              <button onClick={addHazard} style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 7, background: COLORS.zissou + "22", color: COLORS.navy, border: `1.5px dashed ${COLORS.mid}`, padding: "10px 16px", borderRadius: 9, fontSize: 13.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", width: "100%", justifyContent: "center" }}>
+              <button className="no-print" onClick={addHazard} style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 7, background: COLORS.zissou + "22", color: COLORS.navy, border: `1.5px dashed ${COLORS.mid}`, padding: "10px 16px", borderRadius: 9, fontSize: 13.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", width: "100%", justifyContent: "center" }}>
                 <Plus size={17} /> Add hazard
               </button>
             </SectionCard>
@@ -573,8 +652,7 @@ function App() {
                 <Textarea label="Additional action required" value={form.addAction} onChange={(v) => set("addAction", v)} rows={4} />
               </div>
             </SectionCard>
-          </>
-        )}
+        </div>
       </div>
     </div>
   );
@@ -586,7 +664,7 @@ const GYLLY_LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAABiCAYAAA
 
 function Header() {
   return (
-    <div style={{ background: `linear-gradient(135deg, ${COLORS.navy} 0%, ${COLORS.sapphire} 75%, ${COLORS.mid} 130%)`, color: "#fff" }}>
+    <div className="no-print" style={{ background: `linear-gradient(135deg, ${COLORS.navy} 0%, ${COLORS.sapphire} 75%, ${COLORS.mid} 130%)`, color: "#fff" }}>
       <div style={{ maxWidth: 980, margin: "0 auto", padding: "18px 20px", display: "flex", alignItems: "center", gap: 13 }}>
         <div style={{ background: "#fff", borderRadius: 11, padding: "7px 11px", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 1px 4px rgba(8,20,92,.18)" }}>
           <img src={GYLLY_LOGO} alt="Gyllyngvase SLSC" style={{ height: 34, width: "auto", display: "block" }} />
@@ -600,7 +678,7 @@ function Header() {
   );
 }
 
-function BeachProfile({ tideInfo }) {
+function BeachProfile({ tideInfo, sessionTime, date }) {
   const W = 400, H = 200;
   const padL = 38, padR = 14, padT = 14, padB = 28;
   const plotW = W - padL - padR, plotH = H - padT - padB;
@@ -608,6 +686,13 @@ function BeachProfile({ tideInfo }) {
   const hasTides = tideInfo && !tideInfo.error && tideInfo.highHeight && tideInfo.lowHeight;
   const highM = hasTides ? parseFloat(tideInfo.highHeight) : null;
   const lowM = hasTides ? parseFloat(tideInfo.lowHeight) : null;
+
+  // Waterline at session start & end, interpolated from the tide curve.
+  const fmtClock = (ms) => new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  const range = parseSessionRange(sessionTime, date);
+  const extremes = tideInfo && !tideInfo.error ? tideInfo.extremes : null;
+  const startM = range && extremes ? tideHeightAt(extremes, range.start) : null;
+  const endM = range && range.end && extremes ? tideHeightAt(extremes, range.end) : null;
 
   // Vertical scale: 0 m CD at bottom of intertidal, headroom above HW.
   const maxM = hasTides ? Math.max(highM, 5) * 1.15 : 6;
@@ -670,6 +755,29 @@ function BeachProfile({ tideInfo }) {
           </g>
         )}
 
+        {/* session start waterline */}
+        {startM != null && (
+          <g>
+            <line x1={padL} y1={yFor(startM)} x2={W - padR} y2={yFor(startM)} stroke={COLORS.green} strokeWidth="1.5" strokeDasharray="2 2" />
+            <circle cx={padL} cy={yFor(startM)} r="2.4" fill={COLORS.green} />
+            <text x={padL + 5} y={yFor(startM) - 3} fontSize="9" fontWeight="700" fill={COLORS.green} textAnchor="start"
+              style={{ paintOrder: "stroke", stroke: "#fff", strokeWidth: 3, strokeLinejoin: "round" }}>
+              Start {range ? fmtClock(range.start) : ""} · {startM.toFixed(2)} m
+            </text>
+          </g>
+        )}
+        {/* session end waterline */}
+        {endM != null && (
+          <g>
+            <line x1={padL} y1={yFor(endM)} x2={W - padR} y2={yFor(endM)} stroke="#7A5AF8" strokeWidth="1.5" strokeDasharray="2 2" />
+            <circle cx={padL} cy={yFor(endM)} r="2.4" fill="#7A5AF8" />
+            <text x={padL + 5} y={yFor(endM) + 11} fontSize="9" fontWeight="700" fill="#7A5AF8" textAnchor="start"
+              style={{ paintOrder: "stroke", stroke: "#fff", strokeWidth: 3, strokeLinejoin: "round" }}>
+              End {range && range.end ? fmtClock(range.end) : ""} · {endM.toFixed(2)} m
+            </text>
+          </g>
+        )}
+
         {/* labels */}
         <text x={padL + 4} y={padT + 12} fontSize="9.5" fill="#8a7a3a" fontWeight="700">Promenade</text>
         <text x={W - padR - 4} y={padT + 12} fontSize="9.5" fill={COLORS.mid} fontWeight="700" textAnchor="end">Sea →</text>
@@ -677,6 +785,18 @@ function BeachProfile({ tideInfo }) {
           <text x={padL + plotW * 0.5} y={(hwY + lwY) / 2} fontSize="9" fill="#b9770e" fontWeight="600" textAnchor="middle">Intertidal</text>
         )}
       </svg>
+      {(startM != null || endM != null) && (
+        <div style={{ fontSize: 10.5, textAlign: "center", marginTop: 3, display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
+          <span style={{ color: COLORS.green, fontWeight: 700 }}>▬ Session start</span>
+          {endM != null && <span style={{ color: "#7A5AF8", fontWeight: 700 }}>▬ Session end</span>}
+          {startM != null && endM != null && (
+            <span style={{ color: "#6b7684" }}>{endM > startM ? "tide rising" : endM < startM ? "tide falling" : "tide steady"} through session (Δ {Math.abs(endM - startM).toFixed(2)} m)</span>
+          )}
+        </div>
+      )}
+      {range && startM == null && hasTides && (
+        <div style={{ fontSize: 10, color: "#b9770e", textAlign: "center", marginTop: 3 }}>Session time is outside the fetched tide window — start/end waterlines not shown.</div>
+      )}
       {hasTides ? (
         <div style={{ fontSize: 10.5, color: "#6b7684", textAlign: "center", marginTop: 2 }}>
           Tidal range ~{(highM - lowM).toFixed(1)} m today. Slope is representative (Gylly shelves steeply); waterlines are live to Chart Datum.
@@ -837,7 +957,7 @@ function SwimCam() {
 
 function SwimCamFallbackNote() { return null; }
 
-function LivePanel({ wx, loading, error, onFetch, tideInfo, tideKey, onTideKey }) {
+function LivePanel({ wx, loading, error, onFetch, tideInfo, tideKey, onTideKey, sessionTime, date }) {
   const [showKey, setShowKey] = React.useState(false);
   const tile = (icon, label, val) => (
     <div style={{ background: "#fff", borderRadius: 8, padding: "8px 11px", border: "1px solid #e6eaf1", minWidth: 92 }}>
@@ -846,7 +966,7 @@ function LivePanel({ wx, loading, error, onFetch, tideInfo, tideKey, onTideKey }
     </div>
   );
   return (
-    <div style={{ background: `linear-gradient(135deg, ${COLORS.zissou}1f, ${COLORS.mid}14)`, border: `1px solid ${COLORS.zissou}55`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
+    <div className="no-print" style={{ background: `linear-gradient(135deg, ${COLORS.zissou}1f, ${COLORS.mid}14)`, border: `1px solid ${COLORS.zissou}55`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <CloudSun size={18} color={COLORS.mid} />
@@ -901,7 +1021,7 @@ function LivePanel({ wx, loading, error, onFetch, tideInfo, tideKey, onTideKey }
           )}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 12 }}>
             <BeachSchematic wx={wx} />
-            <BeachProfile tideInfo={tideInfo} />
+            <BeachProfile tideInfo={tideInfo} sessionTime={sessionTime} date={date} />
           </div>
           <div style={{ marginTop: 9, fontSize: 11, color: "#6b7684" }}>
             Auto-filled into Water State, Other Risks & tide fields. Bands are conservative guidance — confirm against your own judgement before signing. Sources: Open-Meteo (weather/waves), WorldTides (tides). Tide heights are to Chart Datum.
