@@ -466,6 +466,23 @@ function ToolCard({ onClick, Icon, name, tagline, desc, accent }) {
   );
 }
 
+// Landing-page disclaimer: the club ethos line plus the safety caveats.
+function Disclaimer() {
+  return (
+    <div style={{ marginTop: 28, background: "#fff", border: "1px solid #e6eaf1", borderRadius: 14, padding: "18px 20px", boxShadow: "0 1px 3px rgba(8,20,92,.04)" }}>
+      <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: COLORS.navy, lineHeight: 1.5 }}>
+        “The secret to a fun session is a good idea — use these tools to get yours on the water quickly, safely, and share with others.”
+      </p>
+      <div style={{ display: "flex", gap: 9, marginTop: 12, alignItems: "flex-start" }}>
+        <AlertTriangle size={16} color={COLORS.yellow} style={{ flexShrink: 0, marginTop: 2 }} />
+        <p style={{ margin: 0, fontSize: 12.5, color: "#6b7684", lineHeight: 1.55 }}>
+          <strong style={{ color: "#4a5563" }}>Disclaimer:</strong> These tools are decision aids, not a substitute for the judgement of a qualified coach or the competent person responsible for the session. Weather, wave and tide data come from third-party forecasts (Open-Meteo, WorldTides) and may be inaccurate, delayed or unavailable — always confirm conditions on site before entering the water. The beach-profile slope is representative, not surveyed. Gyllyngvase SLSC accepts no liability for decisions made using these tools.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 // ---- App -------------------------------------------------------------------
 
 function App() {
@@ -585,6 +602,7 @@ function App() {
             <ToolCard onClick={() => setView("planning")} Icon={CloudSun} name="Sheila" tagline="Session Planning"
               desc="Live & forecast conditions for your session window — tides, wind & swell plan view, and the beach profile with session start / end waterlines." accent={COLORS.mid} />
           </div>
+          <Disclaimer />
         </div>
       </div>
     );
